@@ -6,7 +6,9 @@ A Streamlit application that extracts structured information from technical docu
 
 - **Model Selection**: Choose between Gemini 2.5 Flash (default) and Pro models
 - **Schema Options**: Select between basic and advanced extraction schemas
-- **GCS Integration**: Browse and select documents from Google Cloud Storage
+- **Document Input Options**: 
+  - Browse and select documents from Google Cloud Storage
+  - Upload local PDF files directly from your computer
 - **Multiple View Modes**: View results as formatted JSON, raw JSON, or expandable sections
 - **Export Options**: Download extracted data as JSON or copy to clipboard
 
@@ -43,7 +45,9 @@ extract-and-optimize-demo/
 
 1. Select a model from the sidebar (defaults to Gemini 2.5 Flash)
 2. Choose a schema type (Advanced or Basic)
-3. Select a document from the GCS bucket
+3. Select your document source:
+   - **Google Cloud Storage**: Browse and select from available documents
+   - **Upload Local File**: Upload a PDF file from your computer
 4. Optionally modify the extraction prompt
 5. Click "Extract Information" to process the document
 6. View results in your preferred format

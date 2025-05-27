@@ -4,6 +4,8 @@ from google.genai import types
 from google.cloud import storage
 import json
 import subprocess
+import tempfile
+import os
 
 from config.schema import schema_work_package_basic, schema_work_package_advanced
 from config.system_prompt import system_prompt as default_system_prompt
@@ -22,6 +24,8 @@ if 'custom_schema' not in st.session_state:
     st.session_state.custom_schema = None
 if 'custom_system_prompt' not in st.session_state:
     st.session_state.custom_system_prompt = None
+if 'selected_filename' not in st.session_state:
+    st.session_state.selected_filename = None
 
 @st.cache_data
 def get_project_id():
@@ -57,8 +61,37 @@ def initialize_client(project_id, region):
         location=region,
     )
 
-def generate_extraction(client, prompt, file_path, model, schema_type):
-    """Generate extraction from document"""
+def process_uploaded_file(uploaded_file):
+    """Process uploaded file and convert to genai Part object."""
+    if uploaded_file is None:
+        return None
+        
+    # Create a temporary file to store the uploaded content
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        tmp_file_path = tmp_file.name
+    
+    # Read the file content
+    with open(tmp_file_path, "rb") as f:
+        file_content = f.read()
+    
+    # Clean up temporary file
+    os.unlink(tmp_file_path)
+    
+    # Create Part object from file data
+    return types.Part.from_bytes(data=file_content, mime_type="application/pdf")
+
+def generate_extraction(client, prompt, file_input, model, schema_type, is_uploaded_file=False):
+    """Generate extraction from document
+    
+    Args:
+        client: The genai client
+        prompt: The extraction prompt
+        file_input: Either a GCS path (str) or a Part object (for uploaded files)
+        model: The model to use
+        schema_type: The schema type to use
+        is_uploaded_file: Boolean indicating if file_input is an uploaded file Part
+    """
     # Select schema based on user choice
     if st.session_state.custom_schema and schema_type == "Custom":
         schema = st.session_state.custom_schema
@@ -69,10 +102,15 @@ def generate_extraction(client, prompt, file_path, model, schema_type):
     system_prompt = st.session_state.custom_system_prompt if st.session_state.custom_system_prompt else default_system_prompt
     
     # Prepare content with PDF file
-    pdf_file = types.Part.from_uri(
-        file_uri=file_path,
-        mime_type="application/pdf",
-    )
+    if is_uploaded_file:
+        # file_input is already a Part object
+        pdf_file = file_input
+    else:
+        # file_input is a GCS path
+        pdf_file = types.Part.from_uri(
+            file_uri=file_input,
+            mime_type="application/pdf",
+        )
     
     contents = [
         types.Content(
@@ -210,48 +248,81 @@ col1, col2 = st.columns([1, 2])
 with col1:
     st.header("Document Selection")
     
-    # List files from bucket
-    files = list_files_in_bucket()
+    # Add tabs for file source selection
+    file_source = st.radio(
+        "Select file source:",
+        ["Google Cloud Storage", "Upload Local File"],
+        horizontal=True
+    )
     
-    if files:
-        selected_file = st.selectbox(
-            "Select a document from GCS",
-            files,
-            format_func=lambda x: x.split('/')[-1]  # Show only filename
-        )
+    file_selected = False
+    file_input = None
+    is_uploaded_file = False
+    selected_filename = None
+    
+    if file_source == "Google Cloud Storage":
+        # List files from bucket
+        files = list_files_in_bucket()
         
-        # Construct full GCS path
-        if selected_file:
-            file_path = f"gs://wec_demo_files/{selected_file}"
-            st.success(f"Selected: {selected_file.split('/')[-1]}")
-            
-            # Custom prompt
-            prompt = st.text_area(
-                "Extraction Prompt",
-                value="Review this document, and extract key elements and information. Respond ONLY with a valid JSON object strictly conforming to the required schema.",
-                height=100
+        if files:
+            selected_file = st.selectbox(
+                "Select a document from GCS",
+                files,
+                format_func=lambda x: x.split('/')[-1]  # Show only filename
             )
             
-            # Extract button
-            if st.button("🚀 Extract Information", type="primary"):
-                with st.spinner("Processing document..."):
-                    try:
-                        # Initialize client
-                        client = initialize_client(project_id, region)
-                        
-                        # Generate extraction
-                        response, token_count = generate_extraction(
-                            client, prompt, file_path, model_option, schema_type
-                        )
-                        
-                        # Parse and store result
-                        st.session_state.extracted_data = json.loads(response.text)
-                        st.success(f"✅ Extraction complete! ({token_count} input tokens)")
-                        
-                    except Exception as e:
-                        st.error(f"Error during extraction: {str(e)}")
-    else:
-        st.error("No files found in the bucket")
+            # Construct full GCS path
+            if selected_file:
+                file_input = f"gs://wec_demo_files/{selected_file}"
+                selected_filename = selected_file.split('/')[-1]
+                file_selected = True
+                is_uploaded_file = False
+                st.success(f"Selected: {selected_filename}")
+        else:
+            st.error("No files found in the bucket")
+    
+    else:  # Upload Local File
+        uploaded_file = st.file_uploader(
+            "Choose a PDF file",
+            type=['pdf'],
+            help="Upload a PDF document for extraction"
+        )
+        
+        if uploaded_file is not None:
+            file_input = process_uploaded_file(uploaded_file)
+            selected_filename = uploaded_file.name
+            file_selected = True
+            is_uploaded_file = True
+            st.success(f"Uploaded: {selected_filename}")
+    
+    # Show prompt and extract button only if a file is selected
+    if file_selected:
+        # Custom prompt
+        prompt = st.text_area(
+            "Extraction Prompt",
+            value="Review this document, and extract key elements and information. Respond ONLY with a valid JSON object strictly conforming to the required schema.",
+            height=100
+        )
+        
+        # Extract button
+        if st.button("🚀 Extract Information", type="primary"):
+            with st.spinner("Processing document..."):
+                try:
+                    # Initialize client
+                    client = initialize_client(project_id, region)
+                    
+                    # Generate extraction
+                    response, token_count = generate_extraction(
+                        client, prompt, file_input, model_option, schema_type, is_uploaded_file
+                    )
+                    
+                    # Parse and store result
+                    st.session_state.extracted_data = json.loads(response.text)
+                    st.session_state.selected_filename = selected_filename
+                    st.success(f"✅ Extraction complete! ({token_count} input tokens)")
+                    
+                except Exception as e:
+                    st.error(f"Error during extraction: {str(e)}")
 
 with col2:
     st.header("Extraction Results")
@@ -379,10 +450,12 @@ with col2:
         with col1_dl:
             # Download JSON button
             json_str = json.dumps(st.session_state.extracted_data, indent=2)
+            # Use the filename from session state
+            download_filename = st.session_state.selected_filename.replace('.pdf', '') if st.session_state.selected_filename else "extraction"
             st.download_button(
                 label="📥 Download JSON",
                 data=json_str,
-                file_name=f"extraction_{selected_file.split('/')[-1].replace('.pdf', '')}.json",
+                file_name=f"extraction_{download_filename}.json",
                 mime="application/json"
             )
         
