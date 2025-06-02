@@ -5,7 +5,11 @@ A Streamlit application that extracts structured information from technical docu
 ## Features
 
 - **Model Selection**: Choose between Gemini 2.5 Flash (default) and Pro models
-- **Schema Options**: Select between basic and advanced extraction schemas
+- **Schema Options**: 
+  - Dynamic dropdown of all available schemas in config/schema.py
+  - Currently includes: Work Package (Basic & Advanced), Construction Work Package (CWP)
+  - Support for custom schema uploads
+  - Schema preview in expandable section
 - **Document Input Options**: 
   - Browse and select documents from Google Cloud Storage
   - Upload local PDF files directly from your computer
@@ -44,7 +48,10 @@ extract-and-optimize-demo/
 ## Usage
 
 1. Select a model from the sidebar (defaults to Gemini 2.5 Flash)
-2. Choose a schema type (Advanced or Basic)
+2. Choose a schema from the dropdown:
+   - Automatically discovers all schemas in config/schema.py
+   - View schema details in the expandable section
+   - Upload custom schemas via the file uploader
 3. Select your document source:
    - **Google Cloud Storage**: Browse and select from available documents
    - **Upload Local File**: Upload a PDF file from your computer
