@@ -182,5 +182,3 @@ Thumbs.db
 
 # Google Cloud service account files
 service-account*.json
-
-Dockerfile
