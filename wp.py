@@ -6,9 +6,13 @@ import json
 import subprocess
 import tempfile
 import os
+from dotenv import load_dotenv
 
 import config.schema as schemas
 from config.system_prompt import system_prompt as default_system_prompt, task_extraction_system_prompt
+
+# Load environment variables
+load_dotenv()
 
 # Page header
 st.header("📋 Work Package Extraction")
@@ -27,14 +31,29 @@ if 'selected_filename' not in st.session_state:
 
 @st.cache_data
 def get_project_id():
-    """Get the current GCP project ID"""
-    result = subprocess.run(['gcloud', 'config', 'get-value', 'project'], 
-                          capture_output=True, text=True)
-    return result.stdout.strip()
+    """Get the current GCP project ID from environment variables or gcloud config"""
+    project_id = os.getenv('GCP_PROJECT_ID')
+    if project_id:
+        return project_id
+    
+    # Fallback to gcloud config if env var not set
+    try:
+        result = subprocess.run(['gcloud', 'config', 'get-value', 'project'], 
+                              capture_output=True, text=True)
+        return result.stdout.strip()
+    except Exception:
+        st.error("Could not determine GCP project ID. Please set GCP_PROJECT_ID environment variable.")
+        return None
 
 @st.cache_data
-def list_files_in_bucket(bucket_name="wec_demo_files", prefix="examples/"):
+def list_files_in_bucket(bucket_name=None, prefix=None):
     """List files in a GCS bucket with given prefix"""
+    # Use environment variables with fallback defaults
+    if bucket_name is None:
+        bucket_name = os.getenv('GCS_BUCKET_NAME', 'wec_demo_files')
+    if prefix is None:
+        prefix = os.getenv('GCS_PREFIX', 'examples/')
+    
     try:
         storage_client = storage.Client()
         bucket = storage_client.bucket(bucket_name)
@@ -512,11 +531,17 @@ def generate_extraction(client, prompt, file_input, model, selected_schema, sele
 with st.sidebar:
     st.header("Configuration")
     
-    # Model selection
+    # Model selection with environment variable defaults
+    default_model = os.getenv('DEFAULT_MODEL', 'gemini-2.5-pro-preview-05-06')
+    flash_model = os.getenv('FLASH_MODEL', 'gemini-2.5-flash-preview-05-20')
+    
+    model_options = [flash_model, default_model]
+    default_index = 1 if default_model in model_options else 0
+    
     model_option = st.selectbox(
         "Select Model",
-        ["gemini-2.5-flash-preview-05-20", "gemini-2.5-pro-preview-05-06"],
-        index=1  # Default to Pro
+        model_options,
+        index=default_index
     )
     
     # Get available schemas
@@ -548,8 +573,9 @@ with st.sidebar:
     if selected_schema_name == 'Task-Based Work Package' and not st.session_state.custom_system_prompt:
         st.info("ℹ️ Using specialized task extraction system prompt for Task-Based Work Package schema")
     
-    # Region
-    region = st.text_input("Region", value="us-central1")
+    # Region with environment variable default
+    default_region = os.getenv('GCP_REGION', 'us-central1')
+    region = st.text_input("Region", value=default_region)
     
     # Get project ID
     project_id = get_project_id()
@@ -638,9 +664,10 @@ with col1:
                 format_func=lambda x: x.split('/')[-1]  # Show only filename
             )
             
-            # Construct full GCS path
+            # Construct full GCS path using environment variable
             if selected_file:
-                file_input = f"gs://wec_demo_files/{selected_file}"
+                bucket_name = os.getenv('GCS_BUCKET_NAME', 'wec_demo_files')
+                file_input = f"gs://{bucket_name}/{selected_file}"
                 selected_filename = selected_file.split('/')[-1]
                 file_selected = True
                 is_uploaded_file = False
