@@ -77,7 +77,6 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
-*.ipynb  # specifically for this repo
 
 # IPython
 profile_default/
