@@ -611,3 +611,257 @@ schema_task_based_work_package = {
     },
     "required": ["project_metadata", "tasks"]
 }
+
+ifc_schema = {
+  "description": "Summarizes key components and metadata of 3D CAD data from an IFC string.",
+  "type": "OBJECT",
+  "properties": {
+    "projectMetadata": {
+      "description": "Overall project identification and authorship information.",
+      "type": "OBJECT",
+      "properties": {
+        "projectName": {
+          "description": "Name of the overall project.",
+          "type": "STRING"
+        },
+        "globalId": {
+          "description": "Globally unique identifier for the project.",
+          "type": "STRING"
+        },
+        "schemaVersion": {
+          "description": "IFC schema version used (e.g., IFC4).",
+          "type": "STRING"
+        },
+        "creationDate": {
+          "description": "Date and time when the IFC file was created.",
+          "type": "STRING",
+          "format": "date-time"
+        },
+        "authoringTool": {
+          "description": "Software used to author the IFC model.",
+          "type": "STRING"
+        },
+        "organization": {
+          "description": "Organization that authored the IFC model.",
+          "type": "STRING"
+        },
+        "description": {
+          "description": "General description of the project.",
+          "type": "STRING"
+        }
+      },
+      "required": ["projectName", "globalId", "schemaVersion"]
+    },
+    "overallSpatialPlacement": {
+      "description": "High-level positioning and orientation of the model's site and main building.",
+      "type": "OBJECT",
+      "properties": {
+        "site": {
+          "description": "Geographical placement information for the site.",
+          "type": "OBJECT",
+          "properties": {
+            "name": {
+              "description": "Name of the site.",
+              "type": "STRING"
+            },
+            "globalId": {
+              "description": "Globally unique identifier for the site.",
+              "type": "STRING"
+            },
+            "easting": {
+              "description": "Easting coordinate of the site's origin.",
+              "type": "NUMBER"
+            },
+            "northing": {
+              "description": "Northing coordinate of the site's origin.",
+              "type": "NUMBER"
+            },
+            "elevation": {
+              "description": "Elevation of the site's origin.",
+              "type": "NUMBER"
+            },
+            "trueNorthOrientation": {
+              "description": "Angle in degrees from the Y-axis to true North.",
+              "type": "NUMBER"
+            }
+          },
+          "required": ["globalId"]
+        },
+        "building": {
+          "description": "Main building's placement relative to the site.",
+          "type": "OBJECT",
+          "properties": {
+            "name": {
+              "description": "Name of the building.",
+              "type": "STRING"
+            },
+            "globalId": {
+              "description": "Globally unique identifier for the building.",
+              "type": "STRING"
+            },
+            "x": {
+              "description": "X-coordinate of the building's origin.",
+              "type": "NUMBER"
+            },
+            "y": {
+              "description": "Y-coordinate of the building's origin.",
+              "type": "NUMBER"
+            },
+            "z": {
+              "description": "Z-coordinate (elevation) of the building's origin.",
+              "type": "NUMBER"
+            },
+            "rotationDegrees": {
+              "description": "Rotation of the building in degrees around X, Y, and Z axes.",
+              "type": "OBJECT",
+              "properties": {
+                "x": {
+                  "type": "NUMBER"
+                },
+                "y": {
+                  "type": "NUMBER"
+                },
+                "z": {
+                  "type": "NUMBER"
+                }
+              }
+            }
+          },
+          "required": ["globalId", "x", "y", "z"]
+        }
+      },
+      "required": ["site", "building"]
+    },
+    "componentSummary": {
+      "description": "Statistical overview and bounding volume of all components.",
+      "type": "OBJECT",
+      "properties": {
+        "totalComponents": {
+          "description": "Total number of individual components in the design.",
+          "type": "INTEGER"
+        },
+        "componentTypes": {
+          "description": "Breakdown of components by type with counts and an example GlobalId.",
+          "type": "ARRAY",
+          "items": {
+            "type": "OBJECT",
+            "properties": {
+              "type": {
+                "description": "IFC type of the component (e.g., IfcWall, IfcDoor).",
+                "type": "STRING"
+              },
+              "count": {
+                "description": "Number of components of this type.",
+                "type": "INTEGER"
+              },
+              "exampleGlobalId": {
+                "description": "An example GlobalId for a component of this type.",
+                "type": "STRING"
+              }
+            },
+            "required": ["type", "count"]
+          }
+        },
+        "boundingVolume": {
+          "description": "Overall bounding box encompassing all model components.",
+          "type": "OBJECT",
+          "properties": {
+            "minX": {
+              "type": "NUMBER"
+            },
+            "minY": {
+              "type": "NUMBER"
+            },
+            "minZ": {
+              "type": "NUMBER"
+            },
+            "maxX": {
+              "type": "NUMBER"
+            },
+            "maxY": {
+              "type": "NUMBER"
+            },
+            "maxZ": {
+              "type": "NUMBER"
+            }
+          },
+          "required": ["minX", "minY", "minZ", "maxX", "maxY", "maxZ"]
+        }
+      },
+      "required": ["totalComponents", "componentTypes", "boundingVolume"]
+    },
+    "components": {
+      "description": "A list of individual 3D CAD components with their key properties.",
+      "type": "ARRAY",
+      "items": {
+        "type": "OBJECT",
+        "properties": {
+          "globalId": {
+            "description": "Globally unique identifier for the component.",
+            "type": "STRING"
+          },
+          "name": {
+            "description": "Name or common identifier of the component.",
+            "type": "STRING"
+          },
+          "type": {
+            "description": "IFC type of the component (e.g., IfcWall, IfcDoor).",
+            "type": "STRING"
+          },
+          "storey": {
+            "description": "The building storey/level to which the component belongs.",
+            "type": "STRING"
+          },
+          "material": {
+            "description": "Primary material assigned to the component.",
+            "type": "STRING"
+          },
+          "x": {
+            "description": "X-coordinate of the component's origin.",
+            "type": "NUMBER"
+          },
+          "y": {
+            "description": "Y-coordinate of the component's origin.",
+            "type": "NUMBER"
+          },
+          "z": {
+            "description": "Z-coordinate (elevation) of the component's origin.",
+            "type": "NUMBER"
+          },
+          "rotationDegrees": {
+            "description": "Rotation of the component in degrees around X, Y, and Z axes.",
+            "type": "OBJECT",
+            "properties": {
+              "x": {
+                "type": "NUMBER"
+              },
+              "y": {
+                "type": "NUMBER"
+              },
+              "z": {
+                "type": "NUMBER"
+              }
+            }
+          },
+          "dimensions": {
+            "description": "Approximate overall dimensions of the component.",
+            "type": "OBJECT",
+            "properties": {
+              "length": {
+                "type": "NUMBER"
+              },
+              "width": {
+                "type": "NUMBER"
+              },
+              "height": {
+                "type": "NUMBER"
+              }
+            }
+          }
+        },
+        "required": ["globalId", "name", "type", "x", "y", "z"]
+      }
+    }
+  },
+  "required": ["projectMetadata", "overallSpatialPlacement", "componentSummary", "components"]
+}
