@@ -177,10 +177,9 @@ local/
 ehthumbs.db
 Thumbs.db
 
-# Streamlit
-.streamlit/
-
 # Google Cloud service account files
 service-account*.json
 
 secrets.toml
+
+.claude/
