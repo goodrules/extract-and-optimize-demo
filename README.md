@@ -83,17 +83,18 @@ gcloud run deploy wp-extract-demo --source . --region="us-central1"
 
 ### Step 4: Configure Environment and Secrets
 1. Go to Cloud Run service → Source → Edit source
-2. Rename `.env.example` to `.env` and update with your configuration:
+2. Rename `.env.example` to `.env` and update with your configuration, for example:
 ```bash
 GCP_PROJECT_ID=your-project-id
 GCS_BUCKET_NAME=your-bucket
 GCS_PREFIX=examples/
-GCP_REGION=us-central1
+GCS_IFC_PREFIX=examples/drawings/
+GCP_REGION=global
 DEFAULT_MODEL=gemini-2.5-pro-preview-06-05
 FLASH_MODEL=gemini-2.5-flash-preview-05-20
 ```
 3. Rename `secrets.toml.example` to `secrets.toml`
-4. Update with your Google Auth Platform credentials:
+4. Update with your Google Auth Platform credentials, for example:
 ```toml
 [auth]
 redirect_uri = "https://your-app-url/oauth2callback"
