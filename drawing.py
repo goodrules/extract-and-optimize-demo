@@ -7,6 +7,10 @@ import subprocess
 import tempfile
 import os
 from dotenv import load_dotenv
+import fitz  # PyMuPDF for PDF processing
+from PIL import Image
+import io
+import base64
 
 import config.schema as schemas
 from config.system_prompt import system_prompt as default_system_prompt
@@ -24,6 +28,8 @@ if 'original_extracted_data' not in st.session_state:
     st.session_state.original_extracted_data = None
 if 'selected_filename' not in st.session_state:
     st.session_state.selected_filename = None
+if 'pdf_preview_data' not in st.session_state:
+    st.session_state.pdf_preview_data = None
 
 @st.cache_data
 def get_project_id():
@@ -230,13 +236,20 @@ IFC STRUCTURE PARSING INSTRUCTIONS:
 COMPONENT EXTRACTION STRATEGY:
 1. Scan ALL entity definitions starting with # (e.g., #123= IFCFLOWFITTING(...))
 2. For each component entity:
-   - Extract globalId (unique identifier)
+   - Extract globalId (unique identifier) - THIS MUST BE UNIQUE
    - Extract name/description
    - Extract type (entity class name)
    - Find referenced IFCLOCALPLACEMENT for coordinates
    - Find referenced IFCMATERIAL for material info
    - Calculate dimensions from geometry references
 3. Cross-reference placement and material data by ID numbers
+
+CRITICAL DEDUPLICATION REQUIREMENTS:
+- Each component's globalId MUST be unique - never include the same globalId twice
+- Do NOT extract the same physical component multiple times (check coordinates + type)
+- Distinguish between actual components and their references/relationships
+- If a component appears in multiple contexts, extract it only ONCE with complete information
+- Skip abstract entities like placements, materials, or geometry definitions - only extract actual building components
 
 COORDINATE EXTRACTION:
 - Find IFCLOCALPLACEMENT entities and their referenced IFCAXIS2PLACEMENT3D
@@ -315,22 +328,625 @@ def validate_extraction_completeness(extracted_data, expected_structure):
             missing_count = expected_structure['total_components'] - validation_results['extracted_count']
             validation_results['messages'].append(f"⚠️ Missing {missing_count} components ({validation_results['extracted_count']}/{expected_structure['total_components']} extracted)")
         
-        # Check component types
-        if 'componentSummary' in extracted_data and 'componentTypes' in extracted_data['componentSummary']:
-            extracted_types = {item['type']: item['count'] for item in extracted_data['componentSummary']['componentTypes']}
+        # Check component types by counting actual components (more reliable than trusting summary)
+        if 'components' in extracted_data:
+            # Count component types from actual components array
+            actual_type_counts = {}
+            for component in extracted_data['components']:
+                comp_type = component.get('type', 'Unknown')
+                actual_type_counts[comp_type] = actual_type_counts.get(comp_type, 0) + 1
             
             for expected_type, expected_count in expected_structure['component_types'].items():
-                extracted_count = extracted_types.get(expected_type, 0)
-                if extracted_count < expected_count:
+                actual_count = actual_type_counts.get(expected_type, 0)
+                if actual_count < expected_count:
                     validation_results['is_complete'] = False
-                    validation_results['messages'].append(f"⚠️ {expected_type}: {extracted_count}/{expected_count} extracted")
-                elif extracted_count == expected_count:
-                    validation_results['messages'].append(f"✅ {expected_type}: {extracted_count}/{expected_count} extracted")
+                    validation_results['messages'].append(f"⚠️ {expected_type}: {actual_count}/{expected_count} extracted")
+                elif actual_count == expected_count:
+                    validation_results['messages'].append(f"✅ {expected_type}: {actual_count}/{expected_count} extracted")
+                elif actual_count > expected_count:
+                    # This shouldn't happen but let's log it
+                    validation_results['messages'].append(f"ℹ️ {expected_type}: {actual_count}/{expected_count} extracted (more than expected)")
+            
+            # Check for unexpected component types
+            for actual_type, actual_count in actual_type_counts.items():
+                if actual_type not in expected_structure['component_types']:
+                    validation_results['messages'].append(f"ℹ️ {actual_type}: {actual_count} extracted (unexpected type)")
     else:
         validation_results['is_complete'] = False
         validation_results['messages'].append("❌ No components array found in extraction result")
     
     return validation_results
+
+def deduplicate_components(extracted_data, details_container=None):
+    """Remove duplicate components from extracted IFC data
+    
+    Args:
+        extracted_data: The extracted JSON data containing components
+        details_container: Optional container to log deduplication messages
+        
+    Returns:
+        dict: Updated data with duplicates removed
+    """
+    if 'components' not in extracted_data or not extracted_data['components']:
+        return extracted_data
+    
+    components = extracted_data['components']
+    original_count = len(components)
+    
+    # Track deduplication process
+    log_container = details_container if details_container else st
+    log_container.info(f"🔍 Starting deduplication process for {original_count} components...")
+    
+    # Step 1: Remove exact GlobalId duplicates
+    unique_components = {}
+    globalid_duplicates = 0
+    
+    for component in components:
+        global_id = component.get('globalId', '')
+        if global_id and global_id in unique_components:
+            globalid_duplicates += 1
+            # Merge information from duplicate, keeping most complete data
+            existing = unique_components[global_id]
+            merged = merge_component_data(existing, component)
+            unique_components[global_id] = merged
+        else:
+            unique_components[global_id] = component
+    
+    if globalid_duplicates > 0:
+        log_container.warning(f"⚠️ Found {globalid_duplicates} GlobalId duplicates, merged with existing components")
+    
+    # Step 2: Find spatial/geometric duplicates (same location + type)
+    components_list = list(unique_components.values())
+    spatial_duplicates = 0
+    coordinate_tolerance = 10.0  # 10mm tolerance for coordinate matching
+    
+    final_components = []
+    processed_indices = set()
+    
+    for i, component in enumerate(components_list):
+        if i in processed_indices:
+            continue
+            
+        # Look for similar components
+        similar_indices = find_similar_components(
+            component, components_list, i, coordinate_tolerance
+        )
+        
+        # Start with the current component
+        merged_component = component
+        
+        if similar_indices:
+            # Merge all similar components
+            for j in similar_indices:
+                if j not in processed_indices:
+                    merged_component = merge_component_data(merged_component, components_list[j])
+                    processed_indices.add(j)
+                    spatial_duplicates += 1
+        
+        final_components.append(merged_component)
+        processed_indices.add(i)
+    
+    if spatial_duplicates > 0:
+        log_container.warning(f"⚠️ Found {spatial_duplicates} spatial duplicates (same location+type), merged similar components")
+    
+    # Update the extracted data
+    extracted_data['components'] = final_components
+    final_count = len(final_components)
+    
+    # Recalculate component summary statistics
+    if 'componentSummary' in extracted_data:
+        extracted_data['componentSummary'] = recalculate_component_summary(final_components)
+    
+    # Log results with component type breakdown
+    duplicates_removed = original_count - final_count
+    if duplicates_removed > 0:
+        log_container.success(f"✅ Deduplication complete: removed {duplicates_removed} duplicates ({original_count} → {final_count} components)")
+        
+        # Show type breakdown after deduplication
+        if 'componentSummary' in extracted_data and 'componentTypes' in extracted_data['componentSummary']:
+            log_container.info("📊 Final component counts by type:")
+            for comp_type in extracted_data['componentSummary']['componentTypes']:
+                log_container.info(f"  • {comp_type['type']}: {comp_type['count']}")
+    else:
+        log_container.info(f"ℹ️ No duplicates found - all {final_count} components are unique")
+    
+    return extracted_data
+
+def merge_component_data(component1, component2):
+    """Merge data from two similar components, keeping most complete information"""
+    merged = component1.copy()
+    
+    # Merge fields, preferring non-empty values
+    for key, value in component2.items():
+        if key not in merged or not merged[key]:
+            merged[key] = value
+        elif value and key in ['name', 'material', 'storey']:
+            # For text fields, prefer longer/more descriptive values
+            if len(str(value)) > len(str(merged[key])):
+                merged[key] = value
+    
+    return merged
+
+def find_similar_components(target_component, components_list, target_index, tolerance):
+    """Find components with similar coordinates and type"""
+    similar_indices = []
+    
+    target_x = target_component.get('x', 0)
+    target_y = target_component.get('y', 0) 
+    target_z = target_component.get('z', 0)
+    target_type = target_component.get('type', '')
+    target_name = target_component.get('name', '')
+    
+    for i, component in enumerate(components_list):
+        if i == target_index:
+            continue
+            
+        # Check if same type
+        if component.get('type', '') != target_type:
+            continue
+            
+        # Check coordinate proximity
+        comp_x = component.get('x', 0)
+        comp_y = component.get('y', 0)
+        comp_z = component.get('z', 0)
+        
+        distance = ((target_x - comp_x)**2 + (target_y - comp_y)**2 + (target_z - comp_z)**2)**0.5
+        
+        if distance <= tolerance:
+            # Also check if names are similar (for additional confidence)
+            name_similarity = calculate_name_similarity(target_name, component.get('name', ''))
+            if name_similarity > 0.7 or distance < tolerance / 2:  # Very close or similar names
+                similar_indices.append(i)
+    
+    return similar_indices
+
+def calculate_name_similarity(name1, name2):
+    """Calculate similarity between two component names (simple approach)"""
+    if not name1 or not name2:
+        return 0.0
+    
+    name1_clean = name1.lower().strip()
+    name2_clean = name2.lower().strip()
+    
+    if name1_clean == name2_clean:
+        return 1.0
+    
+    # Simple token-based similarity
+    tokens1 = set(name1_clean.split())
+    tokens2 = set(name2_clean.split())
+    
+    if not tokens1 or not tokens2:
+        return 0.0
+    
+    intersection = tokens1.intersection(tokens2)
+    union = tokens1.union(tokens2)
+    
+    return len(intersection) / len(union) if union else 0.0
+
+def recalculate_component_summary(components):
+    """Recalculate component summary statistics after deduplication"""
+    if not components:
+        return {
+            'totalComponents': 0,
+            'componentTypes': [],
+            'boundingVolume': {
+                'minX': 0, 'minY': 0, 'minZ': 0,
+                'maxX': 0, 'maxY': 0, 'maxZ': 0
+            }
+        }
+    
+    # Count by type
+    type_counts = {}
+    type_examples = {}
+    
+    # Calculate bounding volume
+    xs = [c.get('x', 0) for c in components if 'x' in c]
+    ys = [c.get('y', 0) for c in components if 'y' in c]
+    zs = [c.get('z', 0) for c in components if 'z' in c]
+    
+    for component in components:
+        comp_type = component.get('type', 'Unknown')
+        type_counts[comp_type] = type_counts.get(comp_type, 0) + 1
+        
+        if comp_type not in type_examples and component.get('globalId'):
+            type_examples[comp_type] = component['globalId']
+    
+    # Build component types array
+    component_types = []
+    for comp_type, count in type_counts.items():
+        type_entry = {
+            'type': comp_type,
+            'count': count
+        }
+        if comp_type in type_examples:
+            type_entry['exampleGlobalId'] = type_examples[comp_type]
+        component_types.append(type_entry)
+    
+    # Sort by count (descending)
+    component_types.sort(key=lambda x: x['count'], reverse=True)
+    
+    return {
+        'totalComponents': len(components),
+        'componentTypes': component_types,
+        'boundingVolume': {
+            'minX': min(xs) if xs else 0,
+            'minY': min(ys) if ys else 0,
+            'minZ': min(zs) if zs else 0,
+            'maxX': max(xs) if xs else 0,
+            'maxY': max(ys) if ys else 0,
+            'maxZ': max(zs) if zs else 0
+        }
+    }
+
+def check_pdf_exists_in_gcs(ifc_file_path):
+    """Check if corresponding PDF file exists in GCS for the given IFC file"""
+    try:
+        # Convert IFC path to PDF path (same name, different extension)
+        pdf_file_path = ifc_file_path.replace('.ifc', '.pdf').replace('.IFC', '.pdf')
+        
+        # Parse the GCS URI to get bucket and blob path
+        if pdf_file_path.startswith('gs://'):
+            uri_parts = pdf_file_path[5:].split('/', 1)
+            bucket_name = uri_parts[0]
+            blob_path = uri_parts[1] if len(uri_parts) > 1 else ''
+        else:
+            return False
+        
+        # Check if PDF blob exists
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_path)
+        
+        return blob.exists()
+    except Exception as e:
+        st.warning(f"Error checking for PDF: {str(e)}")
+        return False
+
+def download_pdf_from_gcs(pdf_file_path):
+    """Download PDF file from GCS and return bytes"""
+    try:
+        # Parse the GCS URI
+        if pdf_file_path.startswith('gs://'):
+            uri_parts = pdf_file_path[5:].split('/', 1)
+            bucket_name = uri_parts[0]
+            blob_path = uri_parts[1] if len(uri_parts) > 1 else ''
+        else:
+            raise ValueError("Invalid GCS URI format")
+        
+        # Download PDF as bytes
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_path)
+        
+        return blob.download_as_bytes()
+    except Exception as e:
+        st.error(f"Error downloading PDF: {str(e)}")
+        return None
+
+@st.cache_data
+def convert_pdf_to_images(pdf_bytes, max_pages=3):
+    """Convert PDF bytes to images for display. Cache the result for performance."""
+    try:
+        # Validate input
+        if not pdf_bytes:
+            st.error("PDF bytes are empty")
+            return [], 0
+        
+        st.info(f"Processing PDF ({len(pdf_bytes):,} bytes)...")
+        
+        # Open PDF from bytes with error handling
+        try:
+            pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        except Exception as open_error:
+            st.error(f"Failed to open PDF: {str(open_error)}")
+            return [], 0
+        
+        # Check if PDF has pages
+        if pdf_doc.page_count == 0:
+            st.error("PDF has no pages")
+            pdf_doc.close()
+            return [], 0
+        
+        # Store page count before we start processing (and potentially close the document)
+        total_page_count = pdf_doc.page_count
+        st.info(f"PDF has {total_page_count} pages, converting first {min(max_pages, total_page_count)}...")
+        
+        images = []
+        pages_to_convert = min(max_pages, total_page_count)
+        
+        for page_num in range(pages_to_convert):
+            try:
+                page = pdf_doc[page_num]
+                
+                # Use a more conservative zoom level first
+                mat = fitz.Matrix(1.5, 1.5)  # 1.5x zoom instead of 2x
+                pix = page.get_pixmap(matrix=mat)
+                
+                # Convert to PNG bytes first, then to PIL Image
+                png_bytes = pix.tobytes("png")
+                
+                # Create PIL Image from PNG bytes
+                img = Image.open(io.BytesIO(png_bytes))
+                images.append(img)
+                
+                st.success(f"✅ Converted page {page_num + 1}")
+                
+            except Exception as page_error:
+                st.warning(f"Failed to convert page {page_num + 1}: {str(page_error)}")
+                continue
+        
+        # Close the document after processing
+        pdf_doc.close()
+        
+        if not images:
+            st.error("No pages could be converted to images")
+            return [], total_page_count
+        
+        st.success(f"Successfully converted {len(images)} pages")
+        return images, total_page_count
+        
+    except Exception as e:
+        st.error(f"Error in PDF conversion workflow: {str(e)}")
+        import traceback
+        st.error(f"Detailed error: {traceback.format_exc()}")
+        return [], 0
+
+def simple_pdf_display(pdf_bytes, filename):
+    """Fallback method to display PDF using browser's built-in PDF viewer"""
+    try:
+        # Encode PDF as base64 for embedding
+        b64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+        
+        # Create a download link and iframe for PDF viewing
+        st.subheader("📋 PDF Drawing")
+        
+        # Provide download option
+        st.download_button(
+            label="📥 Download PDF",
+            data=pdf_bytes,
+            file_name=filename,
+            mime="application/pdf"
+        )
+        
+        # Try to embed PDF (may not work in all browsers)
+        st.markdown("**PDF Preview:**")
+        pdf_display = f"""
+        <iframe src="data:application/pdf;base64,{b64_pdf}" 
+                width="100%" height="600" type="application/pdf">
+        <p>Your browser does not support PDFs. 
+        <a href="data:application/pdf;base64,{b64_pdf}">Download the PDF</a>.</p>
+        </iframe>
+        """
+        st.markdown(pdf_display, unsafe_allow_html=True)
+        
+        return True
+    except Exception as e:
+        st.error(f"Error displaying PDF: {str(e)}")
+        return False
+
+def convert_pdf_to_images_with_container(pdf_bytes, max_pages=3, container=None):
+    """Convert PDF bytes to images with messages routed to a specific container"""
+    if container is None:
+        container = st  # Default to main streamlit if no container provided
+    
+    try:
+        # Validate input
+        if not pdf_bytes:
+            container.error("PDF bytes are empty")
+            return [], 0
+        
+        container.info(f"📄 Processing PDF ({len(pdf_bytes):,} bytes)...")
+        
+        # Open PDF from bytes with error handling
+        try:
+            pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        except Exception as open_error:
+            container.error(f"❌ Failed to open PDF: {str(open_error)}")
+            return [], 0
+        
+        # Check if PDF has pages
+        if pdf_doc.page_count == 0:
+            container.error("❌ PDF has no pages")
+            pdf_doc.close()
+            return [], 0
+        
+        # Store page count before we start processing
+        total_page_count = pdf_doc.page_count
+        container.info(f"📊 PDF has {total_page_count} pages, converting first {min(max_pages, total_page_count)}...")
+        
+        images = []
+        pages_to_convert = min(max_pages, total_page_count)
+        
+        for page_num in range(pages_to_convert):
+            try:
+                page = pdf_doc[page_num]
+                
+                # Use a more conservative zoom level first
+                mat = fitz.Matrix(1.5, 1.5)  # 1.5x zoom instead of 2x
+                pix = page.get_pixmap(matrix=mat)
+                
+                # Convert to PNG bytes first, then to PIL Image
+                png_bytes = pix.tobytes("png")
+                
+                # Create PIL Image from PNG bytes
+                img = Image.open(io.BytesIO(png_bytes))
+                images.append(img)
+                
+                container.success(f"✅ Converted page {page_num + 1}")
+                
+            except Exception as page_error:
+                container.warning(f"⚠️ Failed to convert page {page_num + 1}: {str(page_error)}")
+                continue
+        
+        # Close the document after processing
+        pdf_doc.close()
+        
+        if not images:
+            container.error("❌ No pages could be converted to images")
+            return [], total_page_count
+        
+        container.success(f"🎉 Successfully converted {len(images)} pages")
+        return images, total_page_count
+        
+    except Exception as e:
+        container.error(f"❌ Error in PDF conversion workflow: {str(e)}")
+        import traceback
+        container.error(f"📋 Detailed error: {traceback.format_exc()}")
+        return [], 0
+
+def process_pdf_preview(ifc_filename, file_source, gcs_file_path=None, details_container=None):
+    """Process PDF and return preview components instead of displaying directly
+    
+    Args:
+        ifc_filename: Name of the IFC file
+        file_source: Source type ("Google Cloud Storage" or "Upload Local File")
+        gcs_file_path: Path to GCS file (if applicable)
+        details_container: Streamlit container to place processing messages in
+        
+    Returns:
+        dict: Contains 'has_preview', 'images', 'total_pages', 'pdf_filename', 'fallback_data'
+    """
+    
+    if file_source == "Google Cloud Storage" and gcs_file_path:
+        # For GCS files, check if corresponding PDF exists
+        pdf_gcs_path = gcs_file_path.replace('.ifc', '.pdf').replace('.IFC', '.pdf')
+        
+        if check_pdf_exists_in_gcs(pdf_gcs_path):
+            # Log PDF discovery in details container
+            if details_container:
+                details_container.success("📄 Found corresponding PDF drawing!")
+            
+            # Download and process PDF (messages go to details container)
+            pdf_bytes = download_pdf_from_gcs(pdf_gcs_path)
+            
+            if pdf_bytes:
+                # Route processing messages to details container
+                container_for_messages = details_container if details_container else st
+                images, total_pages = convert_pdf_to_images_with_container(pdf_bytes, container=container_for_messages)
+                
+                pdf_filename = ifc_filename.replace('.ifc', '.pdf').replace('.IFC', '.pdf')
+                
+                if images:
+                    return {
+                        'has_preview': True,
+                        'images': images,
+                        'total_pages': total_pages,
+                        'pdf_filename': pdf_filename,
+                        'fallback_data': None
+                    }
+                else:
+                    # Fallback data for simple PDF display
+                    if details_container:
+                        details_container.warning("Could not convert PDF to images, trying alternative display method...")
+                    return {
+                        'has_preview': True,
+                        'images': [],
+                        'total_pages': total_pages,
+                        'pdf_filename': pdf_filename,
+                        'fallback_data': {'pdf_bytes': pdf_bytes, 'filename': pdf_filename}
+                    }
+        else:
+            if details_container:
+                details_container.info("ℹ️ No corresponding PDF drawing found")
+            return {'has_preview': False}
+    
+    elif file_source == "Upload Local File":
+        # For local uploads, offer to upload corresponding PDF
+        st.info("💡 **Optional**: Upload the corresponding PDF drawing for preview")
+        
+        uploaded_pdf = st.file_uploader(
+            "Upload corresponding PDF (optional)",
+            type=['pdf'],
+            help=f"Upload the PDF drawing that corresponds to {ifc_filename}",
+            key="pdf_uploader"
+        )
+        
+        if uploaded_pdf is not None:
+            # Log upload success in details container
+            if details_container:
+                details_container.success("📄 PDF drawing uploaded!")
+            
+            # Read PDF bytes with error handling (messages go to details container)
+            try:
+                pdf_bytes = uploaded_pdf.read()
+                uploaded_pdf.seek(0)  # Reset file pointer
+                
+                if len(pdf_bytes) == 0:
+                    if details_container:
+                        details_container.error("❌ Uploaded PDF file is empty")
+                    return {'has_preview': False}
+                else:
+                    # Route processing messages to details container
+                    container_for_messages = details_container if details_container else st
+                    images, total_pages = convert_pdf_to_images_with_container(pdf_bytes, container=container_for_messages)
+                    
+                    if images:
+                        return {
+                            'has_preview': True,
+                            'images': images,
+                            'total_pages': total_pages,
+                            'pdf_filename': uploaded_pdf.name,
+                            'fallback_data': None
+                        }
+                    else:
+                        # Fallback data for simple PDF display
+                        if details_container:
+                            details_container.warning("⚠️ Could not convert PDF to images, trying alternative display method...")
+                        return {
+                            'has_preview': True,
+                            'images': [],
+                            'total_pages': total_pages,
+                            'pdf_filename': uploaded_pdf.name,
+                            'fallback_data': {'pdf_bytes': pdf_bytes, 'filename': uploaded_pdf.name}
+                        }
+                        
+            except Exception as read_error:
+                if details_container:
+                    details_container.error(f"❌ Error reading uploaded PDF: {str(read_error)}")
+                return {'has_preview': False}
+    
+    # Default return if no PDF processing occurred
+    return {'has_preview': False}
+
+def display_pdf_preview_components(preview_data):
+    """Display PDF preview components from processed data in an expander"""
+    if not preview_data.get('has_preview', False):
+        return
+    
+    images = preview_data.get('images', [])
+    total_pages = preview_data.get('total_pages', 0)
+    pdf_filename = preview_data.get('pdf_filename', 'PDF')
+    fallback_data = preview_data.get('fallback_data')
+    
+    # Create expander for drawing preview with page count in title
+    if images:
+        if len(images) > 1:
+            expander_title = f"📋 Drawing Preview ({len(images)} of {total_pages} pages)"
+        else:
+            expander_title = f"📋 Drawing Preview ({total_pages} page{'s' if total_pages != 1 else ''})"
+    else:
+        expander_title = "📋 Drawing Preview"
+    
+    with st.expander(expander_title, expanded=True):
+        if images:
+            # Show page navigation if multiple pages
+            if len(images) > 1:
+                page_num = st.selectbox(
+                    f"Select page to view:",
+                    range(len(images)),
+                    format_func=lambda x: f"Page {x + 1}",
+                    key="pdf_page_preview"
+                )
+                st.image(images[page_num], caption=f"Page {page_num + 1} of {pdf_filename}")
+            else:
+                st.image(images[0], caption=f"{pdf_filename}")
+            
+            if total_pages > len(images):
+                st.info(f"ℹ️ Showing first {len(images)} pages of {total_pages} total pages")
+        
+        elif fallback_data:
+            # Use fallback display method
+            simple_pdf_display(fallback_data['pdf_bytes'], fallback_data['filename'])
 
 # Sidebar configuration
 with st.sidebar:
@@ -387,6 +1003,9 @@ with col1:
     is_uploaded_file = False
     selected_filename = None
     
+    # Initialize PDF preview data
+    # Will be set later if a file is selected and processed
+    
     if file_source == "Google Cloud Storage":
         # List IFC files from bucket
         files = list_ifc_files_in_bucket()
@@ -405,18 +1024,31 @@ with col1:
                 selected_filename = selected_file.split('/')[-1]
                 file_selected = True
                 is_uploaded_file = False
-                st.success(f"Selected: {selected_filename}")
                 
                 # Download and process the file
                 with st.spinner("Downloading IFC file from GCS..."):
                     ifc_content = process_gcs_ifc_file(file_input)
                     if ifc_content:
-                        st.info(f"File size: {len(ifc_content):,} characters")
+                        # Create expander for file details and processing messages
+                        details_expander = st.expander("📁 File Details", expanded=True)
+                        
+                        with details_expander:
+                            st.success(f"✅ Selected: {selected_filename}")
+                            st.info(f"📊 File size: {len(ifc_content):,} characters")
+                            st.caption(f"📍 Source: Google Cloud Storage")
+                            st.caption(f"🔗 Path: {file_input}")
+                        
+                        # Process PDF and store preview data for right column
+                        st.session_state.pdf_preview_data = process_pdf_preview(
+                            selected_filename, file_source, file_input, details_container=details_expander
+                        )
                     else:
                         file_selected = False
+                        st.session_state.pdf_preview_data = None
                         st.error("Failed to download or process the selected file")
         else:
             st.error("No IFC files found in the bucket")
+            st.session_state.pdf_preview_data = None
     
     else:  # Upload Local File
         uploaded_file = st.file_uploader(
@@ -430,8 +1062,23 @@ with col1:
             selected_filename = uploaded_file.name
             file_selected = True
             is_uploaded_file = True
-            st.success(f"Uploaded: {selected_filename}")
-            st.info(f"File size: {len(ifc_content):,} characters")
+            
+            # Create expander for file details and processing messages
+            details_expander = st.expander("📁 File Details", expanded=True)
+            
+            with details_expander:
+                st.success(f"✅ Uploaded: {selected_filename}")
+                st.info(f"📊 File size: {len(ifc_content):,} characters")
+                st.caption(f"📍 Source: Local Upload")
+                st.caption(f"📝 File type: {uploaded_file.type if uploaded_file.type else 'IFC'}")
+            
+            # Process PDF and store preview data for right column
+            st.session_state.pdf_preview_data = process_pdf_preview(
+                selected_filename, file_source, details_container=details_expander
+            )
+        else:
+            # Clear PDF preview if no file uploaded
+            st.session_state.pdf_preview_data = None
     
     # Store structure info in session state for validation
     if 'ifc_structure_info' not in st.session_state:
@@ -439,8 +1086,12 @@ with col1:
 
     # Show extract button only if a file is selected
     if file_selected:
+        # Add visual separator before analysis section
+        st.divider()
+        st.subheader("🔍 Analysis")
+        
         # Extract button
-        if st.button("🚀 Analyze IFC Data", type="primary"):
+        if st.button("🚀 Analyze IFC Data", type="primary", use_container_width=True):
             with st.spinner("Processing IFC file..."):
                 try:
                     # Initialize client
@@ -456,13 +1107,21 @@ with col1:
                     
                     # Parse and store result
                     extracted_result = json.loads(response.text)
-                    st.session_state.extracted_data = extracted_result
-                    st.session_state.original_extracted_data = json.loads(json.dumps(extracted_result))  # Deep copy
+                    
+                    # Apply deduplication to remove duplicate components
+                    try:
+                        deduplicated_result = deduplicate_components(extracted_result)
+                    except Exception as dedup_error:
+                        st.warning(f"⚠️ Deduplication failed: {str(dedup_error)}. Using original data.")
+                        deduplicated_result = extracted_result
+                    
+                    st.session_state.extracted_data = deduplicated_result
+                    st.session_state.original_extracted_data = json.loads(json.dumps(extracted_result))  # Deep copy of original (pre-deduplication)
                     st.session_state.selected_filename = selected_filename
                     
                     # Validate extraction completeness if we have structure info
                     if hasattr(st.session_state, 'ifc_structure_info') and st.session_state.ifc_structure_info:
-                        validation = validate_extraction_completeness(extracted_result, st.session_state.ifc_structure_info)
+                        validation = validate_extraction_completeness(deduplicated_result, st.session_state.ifc_structure_info)
                         
                         if validation['is_complete']:
                             st.success(f"✅ Analysis complete! All {validation['extracted_count']} components extracted successfully. ({token_count} input tokens)")
@@ -482,6 +1141,11 @@ with col1:
 
 with col2:
     st.header("Analysis Results")
+    
+    # Display PDF preview above analysis results
+    if st.session_state.pdf_preview_data:
+        display_pdf_preview_components(st.session_state.pdf_preview_data)
+        st.divider()  # Add separator between preview and analysis results
     
     if st.session_state.extracted_data:
         # Check for incomplete extraction and show helpful guidance
