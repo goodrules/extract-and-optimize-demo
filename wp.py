@@ -17,17 +17,17 @@ load_dotenv()
 # Page header
 st.header("📋 Work Package Extraction")
 
-# Initialize session state
-if 'extracted_data' not in st.session_state:
-    st.session_state.extracted_data = None
-if 'original_extracted_data' not in st.session_state:
-    st.session_state.original_extracted_data = None
+# Initialize session state (page-specific for Work Package)
+if 'wp_extracted_data' not in st.session_state:
+    st.session_state.wp_extracted_data = None
+if 'wp_original_extracted_data' not in st.session_state:
+    st.session_state.wp_original_extracted_data = None
+if 'wp_selected_filename' not in st.session_state:
+    st.session_state.wp_selected_filename = None
 if 'custom_schema' not in st.session_state:
     st.session_state.custom_schema = None
 if 'custom_system_prompt' not in st.session_state:
     st.session_state.custom_system_prompt = None
-if 'selected_filename' not in st.session_state:
-    st.session_state.selected_filename = None
 
 @st.cache_data
 def get_project_id():
@@ -532,7 +532,7 @@ with st.sidebar:
     st.header("Configuration")
     
     # Model selection with environment variable defaults
-    default_model = os.getenv('DEFAULT_MODEL', 'gemini-2.5-pro-preview-05-06')
+    default_model = os.getenv('DEFAULT_MODEL', 'gemini-2.5-pro-preview-06-05')
     flash_model = os.getenv('FLASH_MODEL', 'gemini-2.5-flash-preview-05-20')
     
     model_options = [flash_model, default_model]
@@ -625,6 +625,28 @@ with st.sidebar:
             st.caption("• Custom schema loaded")
         if st.session_state.custom_system_prompt:
             st.caption("• Custom system prompt loaded")
+    
+    # Cross-page status indicators
+    st.divider()
+    st.subheader("📊 Page Status")
+    
+    # Current page status
+    if st.session_state.wp_extracted_data:
+        st.success("✅ Work Package data available")
+        if st.button("🗑️ Clear WP Data", use_container_width=True):
+            st.session_state.wp_extracted_data = None
+            st.session_state.wp_original_extracted_data = None
+            st.session_state.wp_selected_filename = None
+            st.success("Work Package data cleared!")
+            st.rerun()
+    else:
+        st.info("ℹ️ No Work Package data")
+    
+    # Other page status
+    if hasattr(st.session_state, 'drawing_extracted_data') and st.session_state.drawing_extracted_data:
+        st.success("✅ Drawing Analysis data available")
+    else:
+        st.info("ℹ️ No Drawing Analysis data")
     
     # Refresh button
     st.divider()
@@ -721,9 +743,9 @@ with col1:
                     
                     # Parse and store result
                     extracted_result = json.loads(response.text)
-                    st.session_state.extracted_data = extracted_result
-                    st.session_state.original_extracted_data = json.loads(json.dumps(extracted_result))  # Deep copy
-                    st.session_state.selected_filename = selected_filename
+                    st.session_state.wp_extracted_data = extracted_result
+                    st.session_state.wp_original_extracted_data = json.loads(json.dumps(extracted_result))  # Deep copy
+                    st.session_state.wp_selected_filename = selected_filename
                     st.success(f"✅ Extraction complete! ({token_count} input tokens)")
                     
                 except Exception as e:
@@ -732,7 +754,7 @@ with col1:
 with col2:
     st.header("Extraction Results")
     
-    if st.session_state.extracted_data:
+    if st.session_state.wp_extracted_data:
         # Display options
         view_option = st.radio(
             "View format",
@@ -747,7 +769,7 @@ with col2:
             
             # Create form for editing
             with st.form("edit_json_form"):
-                form_data = render_editable_json(st.session_state.extracted_data)
+                form_data = render_editable_json(st.session_state.wp_extracted_data)
                 
                 # Save button
                 col1, col2, col3 = st.columns([1, 1, 2])
@@ -756,8 +778,8 @@ with col2:
                 with col2:
                     reset_clicked = st.form_submit_button("🔄 Reset")
                     if reset_clicked:
-                        if st.session_state.original_extracted_data:
-                            st.session_state.extracted_data = json.loads(json.dumps(st.session_state.original_extracted_data))  # Deep copy
+                        if st.session_state.wp_original_extracted_data:
+                            st.session_state.wp_extracted_data = json.loads(json.dumps(st.session_state.wp_original_extracted_data))  # Deep copy
                             st.success("✅ Data reset to original values!")
                             st.rerun()
                         else:
@@ -768,8 +790,8 @@ with col2:
                 if save_changes:
                     try:
                         # Reconstruct JSON from form data
-                        updated_data = reconstruct_json_from_form(form_data, st.session_state.extracted_data)
-                        st.session_state.extracted_data = updated_data
+                        updated_data = reconstruct_json_from_form(form_data, st.session_state.wp_extracted_data)
+                        st.session_state.wp_extracted_data = updated_data
                         st.success("✅ Changes saved successfully!")
                         st.rerun()
                     except Exception as e:
@@ -777,19 +799,19 @@ with col2:
             
             # Show current JSON structure (read-only) for reference
             with st.expander("📋 View Current JSON Structure", expanded=False):
-                st.code(json.dumps(st.session_state.extracted_data, indent=2), language="json")
+                st.code(json.dumps(st.session_state.wp_extracted_data, indent=2), language="json")
             
         elif view_option == "Raw JSON":
             # Raw JSON in a text area (editable)
             edited_json = st.text_area(
                 "JSON Data (editable)",
-                value=json.dumps(st.session_state.extracted_data, indent=2),
+                value=json.dumps(st.session_state.wp_extracted_data, indent=2),
                 height=500
             )
             
         elif view_option == "Statistics Summary":
             # Calculate and display project statistics (only for task-based schemas)
-            data = st.session_state.extracted_data
+            data = st.session_state.wp_extracted_data
             
             if 'tasks' in data and isinstance(data['tasks'], list):
                 stats = calculate_project_statistics(data)
@@ -881,7 +903,7 @@ with col2:
         
         else:  # Expandable Sections
             # Dynamic display for any schema structure
-            data = st.session_state.extracted_data
+            data = st.session_state.wp_extracted_data
             
             def display_value(value, indent_level=0):
                 """Recursively display values with proper formatting"""
@@ -981,9 +1003,9 @@ with col2:
         
         with col1_dl:
             # Download JSON button
-            json_str = json.dumps(st.session_state.extracted_data, indent=2)
+            json_str = json.dumps(st.session_state.wp_extracted_data, indent=2)
             # Use the filename from session state
-            download_filename = st.session_state.selected_filename.replace('.pdf', '') if st.session_state.selected_filename else "extraction"
+            download_filename = st.session_state.wp_selected_filename.replace('.pdf', '') if st.session_state.wp_selected_filename else "extraction"
             st.download_button(
                 label="📥 Download JSON",
                 data=json_str,

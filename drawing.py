@@ -21,15 +21,15 @@ load_dotenv()
 # Page header
 st.header("🎨 IFC Drawing Analysis")
 
-# Initialize session state
-if 'extracted_data' not in st.session_state:
-    st.session_state.extracted_data = None
-if 'original_extracted_data' not in st.session_state:
-    st.session_state.original_extracted_data = None
-if 'selected_filename' not in st.session_state:
-    st.session_state.selected_filename = None
-if 'pdf_preview_data' not in st.session_state:
-    st.session_state.pdf_preview_data = None
+# Initialize session state (page-specific for Drawing Analysis)
+if 'drawing_extracted_data' not in st.session_state:
+    st.session_state.drawing_extracted_data = None
+if 'drawing_original_extracted_data' not in st.session_state:
+    st.session_state.drawing_original_extracted_data = None
+if 'drawing_selected_filename' not in st.session_state:
+    st.session_state.drawing_selected_filename = None
+if 'drawing_pdf_preview_data' not in st.session_state:
+    st.session_state.drawing_pdf_preview_data = None
 
 @st.cache_data
 def get_project_id():
@@ -246,10 +246,10 @@ COMPONENT EXTRACTION STRATEGY:
 
 CRITICAL DEDUPLICATION REQUIREMENTS:
 - Each component's globalId MUST be unique - never include the same globalId twice
-- Do NOT extract the same physical component multiple times (check coordinates + type)
 - Distinguish between actual components and their references/relationships
 - If a component appears in multiple contexts, extract it only ONCE with complete information
 - Skip abstract entities like placements, materials, or geometry definitions - only extract actual building components
+- Components with identical dimensions are normal (e.g., identical windows, pipes) - include them all if they have different globalIds
 
 COORDINATE EXTRACTION:
 - Find IFCLOCALPLACEMENT entities and their referenced IFCAXIS2PLACEMENT3D
@@ -395,52 +395,29 @@ def deduplicate_components(extracted_data, details_container=None):
     if globalid_duplicates > 0:
         log_container.warning(f"⚠️ Found {globalid_duplicates} GlobalId duplicates, merged with existing components")
     
-    # Step 2: Find spatial/geometric duplicates (same location + type)
-    components_list = list(unique_components.values())
-    spatial_duplicates = 0
-    coordinate_tolerance = 10.0  # 10mm tolerance for coordinate matching
-    
-    final_components = []
-    processed_indices = set()
-    
-    for i, component in enumerate(components_list):
-        if i in processed_indices:
-            continue
-            
-        # Look for similar components
-        similar_indices = find_similar_components(
-            component, components_list, i, coordinate_tolerance
-        )
-        
-        # Start with the current component
-        merged_component = component
-        
-        if similar_indices:
-            # Merge all similar components
-            for j in similar_indices:
-                if j not in processed_indices:
-                    merged_component = merge_component_data(merged_component, components_list[j])
-                    processed_indices.add(j)
-                    spatial_duplicates += 1
-        
-        final_components.append(merged_component)
-        processed_indices.add(i)
-    
-    if spatial_duplicates > 0:
-        log_container.warning(f"⚠️ Found {spatial_duplicates} spatial duplicates (same location+type), merged similar components")
+    # Skip spatial/geometric deduplication - only remove true GlobalId duplicates
+    # Components with same dimensions are legitimate (e.g., identical windows, pipes, etc.)
+    final_components = list(unique_components.values())
+    final_count = len(final_components)
     
     # Update the extracted data
     extracted_data['components'] = final_components
-    final_count = len(final_components)
     
     # Recalculate component summary statistics
     if 'componentSummary' in extracted_data:
         extracted_data['componentSummary'] = recalculate_component_summary(final_components)
+        
+        # Debug: Check if coordinates are present
+        coord_count = sum(1 for c in final_components if 'x' in c and 'y' in c and 'z' in c)
+        if coord_count == 0:
+            log_container.warning(f"⚠️ No components have coordinate data (x, y, z) - bounding volume will be zero")
+        elif coord_count < len(final_components):
+            log_container.info(f"ℹ️ {coord_count}/{len(final_components)} components have coordinate data")
     
     # Log results with component type breakdown
     duplicates_removed = original_count - final_count
     if duplicates_removed > 0:
-        log_container.success(f"✅ Deduplication complete: removed {duplicates_removed} duplicates ({original_count} → {final_count} components)")
+        log_container.success(f"✅ Deduplication complete: removed {duplicates_removed} GlobalId duplicates ({original_count} → {final_count} components)")
         
         # Show type breakdown after deduplication
         if 'componentSummary' in extracted_data and 'componentTypes' in extracted_data['componentSummary']:
@@ -448,7 +425,7 @@ def deduplicate_components(extracted_data, details_container=None):
             for comp_type in extracted_data['componentSummary']['componentTypes']:
                 log_container.info(f"  • {comp_type['type']}: {comp_type['count']}")
     else:
-        log_container.info(f"ℹ️ No duplicates found - all {final_count} components are unique")
+        log_container.info(f"ℹ️ No GlobalId duplicates found - all {final_count} components are unique")
     
     return extracted_data
 
@@ -539,10 +516,24 @@ def recalculate_component_summary(components):
     type_counts = {}
     type_examples = {}
     
-    # Calculate bounding volume
-    xs = [c.get('x', 0) for c in components if 'x' in c]
-    ys = [c.get('y', 0) for c in components if 'y' in c]
-    zs = [c.get('z', 0) for c in components if 'z' in c]
+    # Calculate bounding volume - collect all valid coordinates
+    xs = []
+    ys = []
+    zs = []
+    
+    for component in components:
+        # Check if component has valid coordinate data
+        x = component.get('x')
+        y = component.get('y')
+        z = component.get('z')
+        
+        # Only include coordinates that are present and numeric
+        if x is not None and isinstance(x, (int, float)):
+            xs.append(x)
+        if y is not None and isinstance(y, (int, float)):
+            ys.append(y)
+        if z is not None and isinstance(z, (int, float)):
+            zs.append(z)
     
     for component in components:
         comp_type = component.get('type', 'Unknown')
@@ -568,14 +559,27 @@ def recalculate_component_summary(components):
     return {
         'totalComponents': len(components),
         'componentTypes': component_types,
-        'boundingVolume': {
-            'minX': min(xs) if xs else 0,
-            'minY': min(ys) if ys else 0,
-            'minZ': min(zs) if zs else 0,
-            'maxX': max(xs) if xs else 0,
-            'maxY': max(ys) if ys else 0,
-            'maxZ': max(zs) if zs else 0
+        'boundingVolume': calculate_bounding_volume(xs, ys, zs)
+    }
+
+def calculate_bounding_volume(xs, ys, zs):
+    """Calculate bounding volume from coordinate arrays - simplified approach"""
+    
+    # If no coordinates at all, return zero bounding volume
+    if not xs or not ys or not zs:
+        return {
+            'minX': 0, 'minY': 0, 'minZ': 0,
+            'maxX': 0, 'maxY': 0, 'maxZ': 0
         }
+    
+    # Simple min/max calculation
+    return {
+        'minX': min(xs),
+        'minY': min(ys), 
+        'minZ': min(zs),
+        'maxX': max(xs),
+        'maxY': max(ys),
+        'maxZ': max(zs)
     }
 
 def check_pdf_exists_in_gcs(ifc_file_path):
@@ -953,7 +957,7 @@ with st.sidebar:
     st.header("Configuration")
     
     # Model selection with environment variable defaults
-    default_model = os.getenv('DEFAULT_MODEL', 'gemini-2.5-pro-preview-05-06')
+    default_model = os.getenv('DEFAULT_MODEL', 'gemini-2.5-pro-preview-06-05')
     flash_model = os.getenv('FLASH_MODEL', 'gemini-2.5-flash-preview-05-20')
     
     model_options = [flash_model, default_model]
@@ -975,6 +979,29 @@ with st.sidebar:
     # Get project ID
     project_id = get_project_id()
     st.info(f"Project ID: {project_id}")
+    
+    # Cross-page status indicators
+    st.divider()
+    st.subheader("📊 Page Status")
+    
+    # Current page status
+    if st.session_state.drawing_extracted_data:
+        st.success("✅ Drawing Analysis data available")
+        if st.button("🗑️ Clear Drawing Data", use_container_width=True):
+            st.session_state.drawing_extracted_data = None
+            st.session_state.drawing_original_extracted_data = None
+            st.session_state.drawing_selected_filename = None
+            st.session_state.drawing_pdf_preview_data = None
+            st.success("Drawing Analysis data cleared!")
+            st.rerun()
+    else:
+        st.info("ℹ️ No Drawing Analysis data")
+    
+    # Other page status
+    if hasattr(st.session_state, 'wp_extracted_data') and st.session_state.wp_extracted_data:
+        st.success("✅ Work Package data available")
+    else:
+        st.info("ℹ️ No Work Package data")
     
     # Refresh button
     st.divider()
@@ -1039,16 +1066,16 @@ with col1:
                             st.caption(f"🔗 Path: {file_input}")
                         
                         # Process PDF and store preview data for right column
-                        st.session_state.pdf_preview_data = process_pdf_preview(
+                        st.session_state.drawing_pdf_preview_data = process_pdf_preview(
                             selected_filename, file_source, file_input, details_container=details_expander
                         )
                     else:
                         file_selected = False
-                        st.session_state.pdf_preview_data = None
+                        st.session_state.drawing_pdf_preview_data = None
                         st.error("Failed to download or process the selected file")
         else:
             st.error("No IFC files found in the bucket")
-            st.session_state.pdf_preview_data = None
+            st.session_state.drawing_pdf_preview_data = None
     
     else:  # Upload Local File
         uploaded_file = st.file_uploader(
@@ -1073,12 +1100,12 @@ with col1:
                 st.caption(f"📝 File type: {uploaded_file.type if uploaded_file.type else 'IFC'}")
             
             # Process PDF and store preview data for right column
-            st.session_state.pdf_preview_data = process_pdf_preview(
+            st.session_state.drawing_pdf_preview_data = process_pdf_preview(
                 selected_filename, file_source, details_container=details_expander
             )
         else:
             # Clear PDF preview if no file uploaded
-            st.session_state.pdf_preview_data = None
+            st.session_state.drawing_pdf_preview_data = None
     
     # Store structure info in session state for validation
     if 'ifc_structure_info' not in st.session_state:
@@ -1115,9 +1142,9 @@ with col1:
                         st.warning(f"⚠️ Deduplication failed: {str(dedup_error)}. Using original data.")
                         deduplicated_result = extracted_result
                     
-                    st.session_state.extracted_data = deduplicated_result
-                    st.session_state.original_extracted_data = json.loads(json.dumps(extracted_result))  # Deep copy of original (pre-deduplication)
-                    st.session_state.selected_filename = selected_filename
+                    st.session_state.drawing_extracted_data = deduplicated_result
+                    st.session_state.drawing_original_extracted_data = json.loads(json.dumps(extracted_result))  # Deep copy of original (pre-deduplication)
+                    st.session_state.drawing_selected_filename = selected_filename
                     
                     # Validate extraction completeness if we have structure info
                     if hasattr(st.session_state, 'ifc_structure_info') and st.session_state.ifc_structure_info:
@@ -1143,14 +1170,14 @@ with col2:
     st.header("Analysis Results")
     
     # Display PDF preview above analysis results
-    if st.session_state.pdf_preview_data:
-        display_pdf_preview_components(st.session_state.pdf_preview_data)
+    if st.session_state.drawing_pdf_preview_data:
+        display_pdf_preview_components(st.session_state.drawing_pdf_preview_data)
         st.divider()  # Add separator between preview and analysis results
     
-    if st.session_state.extracted_data:
+    if st.session_state.drawing_extracted_data:
         # Check for incomplete extraction and show helpful guidance
         if hasattr(st.session_state, 'ifc_structure_info') and st.session_state.ifc_structure_info:
-            validation = validate_extraction_completeness(st.session_state.extracted_data, st.session_state.ifc_structure_info)
+            validation = validate_extraction_completeness(st.session_state.drawing_extracted_data, st.session_state.ifc_structure_info)
             if not validation['is_complete']:
                 st.error(f"""
                 🚨 **Incomplete Component Extraction Detected**
@@ -1170,7 +1197,7 @@ with col2:
             horizontal=True
         )
         
-        data = st.session_state.extracted_data
+        data = st.session_state.drawing_extracted_data
         
         if view_option == "Project Overview":
             # Display project metadata and spatial placement
@@ -1231,9 +1258,29 @@ with col2:
                     # Calculate bounding volume if available
                     if 'boundingVolume' in summary:
                         bv = summary['boundingVolume']
-                        volume_mm3 = (bv.get('maxX', 0) - bv.get('minX', 0)) * (bv.get('maxY', 0) - bv.get('minY', 0)) * (bv.get('maxZ', 0) - bv.get('minZ', 0))
-                        volume_m3 = volume_mm3 / (1000 * 1000 * 1000)  # Convert mm³ to m³
-                        st.metric("Bounding Volume", f"{volume_m3:,.2f} m³")
+                        width = bv.get('maxX', 0) - bv.get('minX', 0)
+                        height = bv.get('maxY', 0) - bv.get('minY', 0)
+                        depth = bv.get('maxZ', 0) - bv.get('minZ', 0)
+                        
+                        # Calculate volume
+                        volume_raw = width * height * depth
+                        
+                        # Smart unit detection and conversion
+                        if volume_raw > 1000000:  # Likely in mm³, convert to m³
+                            volume_display = volume_raw / (1000 * 1000 * 1000)
+                            unit = "m³"
+                        elif volume_raw > 1:  # Likely in m³ already
+                            volume_display = volume_raw
+                            unit = "m³"
+                        else:  # Very small or zero
+                            volume_display = volume_raw
+                            unit = "units³"
+                        
+                        if volume_display > 0:
+                            st.metric("Bounding Volume", f"{volume_display:,.2f} {unit}")
+                        else:
+                            st.metric("Bounding Volume", "0.00 m³")
+                            st.caption("⚠️ No valid coordinates found")
                 
                 # Component types breakdown
                 st.subheader("📊 Component Types")
@@ -1249,13 +1296,31 @@ with col2:
             
                 # Bounding volume details
                 if 'boundingVolume' in summary:
-                    st.subheader("📐 Bounding Volume")
+                    st.subheader("📐 Bounding Volume Details")
                     bv = summary['boundingVolume']
+                    
+                    # Show coordinate ranges
                     col_bv1, col_bv2 = st.columns(2)
                     with col_bv1:
-                        st.write(f"**Min Coordinates:** X: {bv.get('minX', 0):.1f} mm, Y: {bv.get('minY', 0):.1f} mm, Z: {bv.get('minZ', 0):.1f} mm")
+                        st.write(f"**Min Coordinates:**")
+                        st.write(f"• X: {bv.get('minX', 0):,.1f} mm")
+                        st.write(f"• Y: {bv.get('minY', 0):,.1f} mm")
+                        st.write(f"• Z: {bv.get('minZ', 0):,.1f} mm")
                     with col_bv2:
-                        st.write(f"**Max Coordinates:** X: {bv.get('maxX', 0):.1f} mm, Y: {bv.get('maxY', 0):.1f} mm, Z: {bv.get('maxZ', 0):.1f} mm")
+                        st.write(f"**Max Coordinates:**")
+                        st.write(f"• X: {bv.get('maxX', 0):,.1f} mm")
+                        st.write(f"• Y: {bv.get('maxY', 0):,.1f} mm")
+                        st.write(f"• Z: {bv.get('maxZ', 0):,.1f} mm")
+                    
+                    # Show dimensions
+                    width = bv.get('maxX', 0) - bv.get('minX', 0)
+                    height = bv.get('maxY', 0) - bv.get('minY', 0)
+                    depth = bv.get('maxZ', 0) - bv.get('minZ', 0)
+                    
+                    st.write(f"**Dimensions:**")
+                    st.write(f"• Width (X): {width:,.1f} mm")
+                    st.write(f"• Height (Y): {height:,.1f} mm") 
+                    st.write(f"• Depth (Z): {depth:,.1f} mm")
         
         elif view_option == "Detailed Components":
             if 'components' in data and data['components']:
@@ -1315,8 +1380,8 @@ with col2:
     
         with col1_dl:
             # Download JSON button
-            json_str = json.dumps(st.session_state.extracted_data, indent=2)
-            download_filename = st.session_state.selected_filename.replace('.ifc', '') if st.session_state.selected_filename else "ifc_analysis"
+            json_str = json.dumps(st.session_state.drawing_extracted_data, indent=2)
+            download_filename = st.session_state.drawing_selected_filename.replace('.ifc', '') if st.session_state.drawing_selected_filename else "ifc_analysis"
             st.download_button(
                 label="📥 Download JSON",
                 data=json_str,
