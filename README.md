@@ -78,44 +78,28 @@ Follow the [Streamlit Google Authentication Tutorial](https://docs.streamlit.io/
 
 ### Step 3: Deploy to Cloud Run
 ```bash
-gcloud run deploy your-app-name \
-    --source . \
-    --region="global" \
-    --set-env-vars="GCP_PROJECT_ID=your-project-id,GCP_REGION=global,GCS_BUCKET_NAME=your-bucket,GCS_PREFIX=your-prefix/,DEFAULT_MODEL=gemini-2.5-pro-preview-06-05,FLASH_MODEL=gemini-2.5-flash-preview-05-20,STREAMLIT_PORT=8501"
+gcloud run deploy wp-extract-demo --source . --region="us-central1"
 ```
 
-### Step 4: Configure Secrets
+### Step 4: Configure Environment and Secrets
 1. Go to Cloud Run service → Source → Edit source
-2. Rename `secrets.toml.example` to `secrets.toml`
-3. Update with your Google Auth Platform credentials:
+2. Rename `.env.example` to `.env` and update with your configuration:
+```bash
+GCP_PROJECT_ID=your-project-id
+GCS_BUCKET_NAME=your-bucket
+GCS_PREFIX=examples/
+GCP_REGION=us-central1
+DEFAULT_MODEL=gemini-2.5-pro-preview-06-05
+FLASH_MODEL=gemini-2.5-flash-preview-05-20
+```
+3. Rename `secrets.toml.example` to `secrets.toml`
+4. Update with your Google Auth Platform credentials:
 ```toml
 [auth]
 redirect_uri = "https://your-app-url/oauth2callback"
 cookie_secret = "your-random-cookie-secret"
 client_id = "your-google-client-id"
 client_secret = "your-google-client-secret"
-server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"
-```
-
-## Configuration
-
-### Environment Variables (.env)
-```bash
-GCP_PROJECT_ID=your-project-id
-GCS_BUCKET_NAME=your-bucket
-GCS_PREFIX=examples/
-GCP_REGION=global
-DEFAULT_MODEL=gemini-2.5-pro-preview-06-05
-FLASH_MODEL=gemini-2.5-flash-preview-05-20
-```
-
-### Authentication Secrets (.streamlit/secrets.toml)
-```toml
-[auth]
-redirect_uri = "http://localhost:8501/oauth2callback"  # Local dev
-client_id = "your-google-oauth-client-id"
-client_secret = "your-google-oauth-client-secret"
-cookie_secret = "random-string-for-cookie-encryption"
 server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"
 ```
 
