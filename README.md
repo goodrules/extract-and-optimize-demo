@@ -17,10 +17,78 @@ AI-powered Streamlit application that extracts structured information from techn
 - Multiple visualization modes
 
 ### 🔧 Technical Capabilities
-- Gemini 2.5 Pro/Flash model selection
+- Gemini 2.5 Pro/Flash model selection with Provisioned Throughput
 - Google Authentication integration
-- Export options (JSON download/clipboard)
+- Export options (JSON download/clipboard) with BigQuery integration planned
 - Custom schema upload support
+
+## Architecture
+
+The application runs as a containerized Streamlit app on Google Cloud Run, leveraging Vertex AI Gemini models with Provisioned Throughput for consistent performance.
+
+```mermaid
+graph TB
+    %% User Layer
+    User[👤 User] --> Auth[🔐 Google OAuth]
+    
+    %% Cloud Infrastructure
+    subgraph "Google Cloud Platform"
+        direction TB
+        
+        subgraph CloudRun["🚀 Google Cloud Run"]
+            direction TB
+            App[📱 Streamlit Application<br/>app.py]
+            App --> WP[📄 Work Package Extraction<br/>wp.py]
+            App --> Drawing[🏗️ IFC Drawing Analysis<br/>drawing.py]
+            Config[⚙️ Configuration<br/>Schemas & Prompts<br/>config/]
+        end
+        
+        GCS[☁️ Google Cloud Storage<br/>Document Repository]
+        PT[⚡ Provisioned Throughput<br/>Vertex AI Gemini]
+        Gemini[🤖 Gemini Models<br/>2.5 Pro & Flash]
+        BigQuery["🏢 BigQuery<br/>Data Warehouse<br/>Analytics Tables<br/>(Planned)"]
+    end
+    
+    %% User Flow
+    Auth --> App
+    
+    %% Input Sources
+    App --> InputSources[📁 Input Sources]
+    InputSources --> Upload[⬆️ File Upload<br/>PDF, IFC Files]
+    InputSources --> GCS
+    
+    %% Processing Flow
+    InputSources --> WP
+    InputSources --> Drawing
+    WP --> PT
+    Drawing --> PT
+    Config --> PT
+    PT --> Gemini
+    
+    %% Processing & Output
+    Gemini --> Extract[🔍 AI Extraction & Analysis<br/>• SOW & Technical Specs<br/>• IFC Component Inventory<br/>• Spatial & Metadata Analysis]
+    Extract --> JSON[📊 Structured JSON Output<br/>Interactive Editor & Validation]
+    
+    %% Export Options
+    JSON --> Export[💾 Export Options]
+    Export --> Download[⬇️ JSON Download]
+    Export --> Clipboard[📋 Clipboard Copy]
+    Export --> BigQuery
+    
+    %% Styling
+    classDef userLayer fill:#e1f5fe
+    classDef appLayer fill:#f3e5f5
+    classDef inputLayer fill:#fff3e0
+    classDef aiLayer fill:#e8f5e8
+    classDef outputLayer fill:#fce4ec
+    classDef cloudLayer fill:#f5f5f5
+    
+    class User,Auth userLayer
+    class CloudRun,App,WP,Drawing,Config appLayer
+    class InputSources,Upload,GCS inputLayer
+    class PT,Gemini,Extract aiLayer
+    class JSON,Export,Download,Clipboard,BigQuery outputLayer
+```
 
 ## Quick Start
 
@@ -106,6 +174,30 @@ server_metadata_url = "https://accounts.google.com/.well-known/openid-configurat
 
 ## Usage
 
+### File Organization
+When using Google Cloud Storage, organize your files as follows:
+
+**Work Package Documents:**
+- Store PDF documents (SOWs, specifications) in a dedicated folder (e.g., `documents/`)
+- Configure `GCS_PREFIX` environment variable to point to this folder
+
+**IFC Drawing Files:**
+- Store IFC files in a separate folder from work package documents (e.g., `drawings/`)
+- Place corresponding PDF-based images of IFC files in the **same folder** as the IFC files
+- Configure `GCS_IFC_PREFIX` environment variable to point to this folder
+
+Example structure:
+```
+your-gcs-bucket/
+├── documents/           # Work Package PDFs
+│   ├── sow_project_a.pdf
+│   └── specs_project_b.pdf
+└── drawings/           # IFC files + PDF images
+    ├── building_model.ifc
+    ├── building_model.pdf  # PDF image of IFC
+    └── site_plan.ifc
+```
+
 ### Work Package Extraction
 1. Select schema (Basic, Advanced, Task-Based, CWP, or Custom)
 2. Choose document source (GCS or local upload)
@@ -129,9 +221,11 @@ server_metadata_url = "https://accounts.google.com/.well-known/openid-configurat
 ## Technologies
 
 - **Streamlit** - Web framework
-- **Google Vertex AI Gemini** - AI processing
+- **Google Vertex AI Gemini** - AI processing (with Provisioned Throughput)
 - **Google Cloud Storage** - Document storage
 - **Google Auth Platform** - Authentication
+- **BigQuery** - Data warehouse for analytics (planned)
+- **Google Cloud Run** - Container deployment
 - **PyMuPDF** - PDF processing
 
 Built by [goodrules](https://github.com/goodrules)
