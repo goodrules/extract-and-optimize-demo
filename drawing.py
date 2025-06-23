@@ -957,8 +957,8 @@ with st.sidebar:
     st.header("Configuration")
     
     # Model selection with environment variable defaults
-    default_model = os.getenv('DEFAULT_MODEL', 'gemini-2.5-pro-preview-06-05')
-    flash_model = os.getenv('FLASH_MODEL', 'gemini-2.5-flash-preview-05-20')
+    default_model = os.getenv('DEFAULT_MODEL', 'gemini-2.5-pro')
+    flash_model = os.getenv('FLASH_MODEL', 'gemini-2.5-flash')
     
     model_options = [flash_model, default_model]
     default_index = 1 if default_model in model_options else 0
@@ -973,7 +973,7 @@ with st.sidebar:
     st.info("ℹ️ Using IFC 3D CAD Analysis Schema")
     
     # Region with environment variable default
-    default_region = os.getenv('GCP_REGION', 'us-central1')
+    default_region = os.getenv('GCP_REGION', 'global')
     region = st.text_input("Region", value=default_region)
     
     # Get project ID
