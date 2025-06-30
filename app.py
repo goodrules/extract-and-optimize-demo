@@ -46,7 +46,7 @@ def main_app():
         st.markdown("Extract structured information from technical documents using AI")
     
     with col2:
-        st.markdown(f"### Welcome, {st.user.name}! 👋")
+        st.markdown(f"### Welcome! 👋")
         if st.button("🚪 Log out", type="secondary"):
             st.logout()
     
@@ -78,7 +78,4 @@ def main_app():
     pg.run()
 
 # Check authentication status and display appropriate screen
-if not st.user.is_logged_in:
-    login_screen()
-else:
-    main_app()
+main_app()
