@@ -118,36 +118,33 @@ streamlit run app.py
 
 ## Cloud Deployment
 
-### Prerequisites
-- Google Cloud project with Vertex AI API enabled
-- Google Auth Platform OAuth 2.0 client configured
-
-### Step 1: Update Dockerfile
-Ensure your Dockerfile is configured for Cloud Run (already optimized):
-```dockerfile
-FROM python:3.13
-EXPOSE 8080
-WORKDIR /app
-COPY . .
-RUN pip install -r requirements.txt
-CMD streamlit run --server.port 8080 --server.enableCORS false app.py
-```
-
-### Step 2: Configure Google Authentication
-
-Follow the [Streamlit Google Authentication Tutorial](https://docs.streamlit.io/develop/tutorials/authentication/google) to:
-
-1. **Create OAuth 2.0 client in Google Cloud Console**
-2. **Configure consent screen and test users**
-3. **Save your credentials:**
-   - Client ID
-   - Client Secret
-   - Server metadata URL: `https://accounts.google.com/.well-known/openid-configuration`
-
-### Step 3: Deploy to Cloud Run
+### 1. Enable Required APIs
 ```bash
-gcloud run deploy wp-extract-demo --source . --region="us-central1"
+# enable services
+gcloud services enable storage.googleapis.com &&
+gcloud services enable run.googleapis.com &&
+gcloud services enable aiplatform.googleapis.com &&
+gcloud services enable cloudbuild.googleapis.com
+
+# grant permissions to service account
+export PROJECT_ID=`gcloud config get-value project`
+export PROJECT_NUMBER=`gcloud projects describe $PROJECT_ID --format="value(projectNumber)"`
+gcloud projects add-iam-policy-binding $PROJECT_ID --member=serviceAccount:$PROJECT_NUMBER-compute@developer.gserviceaccount.com --role="roles/run.builder"
+#gcloud projects add-iam-policy-binding $PROJECT_ID --member=serviceAccount:$PROJECT_NUMBER-compute@developer.gserviceaccount.com --role="roles/logging.logWriter"
+#gcloud projects add-iam-policy-binding $PROJECT_ID --member=serviceAccount:$PROJECT_NUMBER-compute@developer.gserviceaccount.com --role="roles/storage.objectUser"
 ```
+
+### 2. Deploy to Cloud Run
+
+# Manually enable IAP then run:
+> gcloud beta run deploy wp-extract-demo --source . --region="us-central1" --no-allow-unauthenticated --iap
+
+-- Deploying from Artifact Registry ...: Y
+-- Allow unauthenticated invocations...: N
+
+### 3. Enable IAP
+2. Add IAP-secured Web App User to appropriate users
+
 
 ### Step 4: Configure Environment and Secrets
 1. Go to Cloud Run service → Source → Edit source
