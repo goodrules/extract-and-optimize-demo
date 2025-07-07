@@ -11,15 +11,20 @@ import fitz  # PyMuPDF for PDF processing
 from PIL import Image
 import io
 import base64
+import time
 
 import config.schema as schemas
-from config.system_prompt import system_prompt as default_system_prompt
+from config.system_prompt import system_prompt as default_system_prompt, ifc_extraction_system_prompt
 
 # Load environment variables
 load_dotenv()
 
+def wide_space_default():
+    st.set_page_config(layout="wide")
+wide_space_default()
+
 # Page header
-st.header("🎨 IFC Drawing Analysis")
+st.header("🤖 IFC Drawing Analysis")
 
 # Initialize session state (page-specific for Drawing Analysis)
 if 'drawing_extracted_data' not in st.session_state:
@@ -214,61 +219,17 @@ def generate_ifc_extraction(client, ifc_content, model, schema):
             component_guidance += f"- {comp_type}: {count} instances\n"
         component_guidance += f"\nYour output MUST include ALL {structure_info['total_components']} components in the components array."
     
-    prompt = f"""You are an expert IFC (Industry Foundation Classes) file analyzer. Your task is to extract ALL components and comprehensive information from the provided IFC 3D CAD data.
+    prompt = f"""Extract structured component data from the following IFC file.
 
-CRITICAL REQUIREMENTS:
-1. Extract ALL {structure_info['total_components']} individual components - do not limit or sample
-2. Parse the entire IFC structure systematically 
-3. Include every IFCFLOWFITTING, IFCFLOWSEGMENT, IFCWALL, IFCSLAB, IFCBEAM, IFCCOLUMN, IFCDOOR, IFCWINDOW, and other building elements
-4. Calculate accurate statistics (totalComponents={structure_info['total_components']}, componentTypes counts, boundingVolume)
-5. Extract precise coordinates, materials, and dimensions for each component{component_guidance}
+IFC File Analysis Summary:
+- Total components found: {structure_info['total_components']}
+- Component types: {len(structure_info['component_types'])}
+- File size: {content_length:,} characters{component_guidance}
 
-IFC STRUCTURE PARSING INSTRUCTIONS:
-- HEADER section: Extract project metadata, creation info, schema version
-- IFCPROJECT: Project name, description, global ID
-- IFCSITE/IFCBUILDING: Spatial hierarchy and placement
-- IFCLOCALPLACEMENT + IFCCARTESIANPOINT: Component coordinates (x,y,z)
-- IFCAXIS2PLACEMENT3D: Orientation and rotation data
-- Component entities (IFCFLOWFITTING, IFCFLOWSEGMENT, etc.): Names, types, materials
-- IFCPROPERTYSET: Additional component properties
-- IFCMATERIAL: Material assignments
-
-COMPONENT EXTRACTION STRATEGY:
-1. Scan ALL entity definitions starting with # (e.g., #123= IFCFLOWFITTING(...))
-2. For each component entity:
-   - Extract globalId (unique identifier) - THIS MUST BE UNIQUE
-   - Extract name/description
-   - Extract type (entity class name)
-   - Find referenced IFCLOCALPLACEMENT for coordinates
-   - Find referenced IFCMATERIAL for material info
-   - Calculate dimensions from geometry references
-3. Cross-reference placement and material data by ID numbers
-
-CRITICAL DEDUPLICATION REQUIREMENTS:
-- Each component's globalId MUST be unique - never include the same globalId twice
-- Distinguish between actual components and their references/relationships
-- If a component appears in multiple contexts, extract it only ONCE with complete information
-- Skip abstract entities like placements, materials, or geometry definitions - only extract actual building components
-- Components with identical dimensions are normal (e.g., identical windows, pipes) - include them all if they have different globalIds
-
-COORDINATE EXTRACTION:
-- Find IFCLOCALPLACEMENT entities and their referenced IFCAXIS2PLACEMENT3D
-- Extract IFCCARTESIANPOINT coordinates (x, y, z values)
-- Handle coordinate transformations and relative placements
-- Convert all coordinates to absolute world coordinates where possible
-
-STATISTICS CALCULATION:
-- Count every component entity accurately
-- Group by IFC entity type (IFCFLOWFITTING, IFCFLOWSEGMENT, etc.)
-- Calculate overall bounding box from all component coordinates
-- Provide example GlobalId for each component type
-
-IMPORTANT: The components array in your response must include EVERY individual component found in the IFC file. Do not summarize, sample, or limit the number of components.
-
-IFC Data (Length: {content_length:,} characters):
+IFC Data:
 {truncated_content}
 
-Respond ONLY with a valid JSON object strictly conforming to the provided schema. Ensure the components array contains ALL individual components found in the data."""
+Extract ALL {structure_info['total_components']} components according to the provided schema. Return a complete JSON object with every component included in the components array."""
     
     contents = [
         types.Content(
@@ -291,7 +252,7 @@ Respond ONLY with a valid JSON object strictly conforming to the provided schema
         max_output_tokens=65535,  # Maximum tokens for large component lists
         response_modalities=["TEXT"],
         response_mime_type="application/json",
-        system_instruction="You are an expert IFC file parser specializing in comprehensive component extraction. Always extract ALL components found in the data without sampling or limiting.",
+        system_instruction=ifc_extraction_system_prompt,
         response_schema=schema,
         safety_settings=[
             types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
@@ -1057,7 +1018,7 @@ with col1:
                     ifc_content = process_gcs_ifc_file(file_input)
                     if ifc_content:
                         # Create expander for file details and processing messages
-                        details_expander = st.expander("📁 File Details", expanded=True)
+                        details_expander = st.expander("📁 File Details", expanded=False)
                         
                         with details_expander:
                             st.success(f"✅ Selected: {selected_filename}")
@@ -1091,7 +1052,7 @@ with col1:
             is_uploaded_file = True
             
             # Create expander for file details and processing messages
-            details_expander = st.expander("📁 File Details", expanded=True)
+            details_expander = st.expander("📁 File Details", expanded=False)
             
             with details_expander:
                 st.success(f"✅ Uploaded: {selected_filename}")
@@ -1119,6 +1080,9 @@ with col1:
         
         # Extract button
         if st.button("🚀 Analyze IFC Data", type="primary", use_container_width=True):
+            # Start timing
+            start_time = time.time()
+            
             with st.spinner("Processing IFC file..."):
                 try:
                     # Initialize client
@@ -1146,14 +1110,17 @@ with col1:
                     st.session_state.drawing_original_extracted_data = json.loads(json.dumps(extracted_result))  # Deep copy of original (pre-deduplication)
                     st.session_state.drawing_selected_filename = selected_filename
                     
+                    # Calculate execution time
+                    execution_time = time.time() - start_time
+                    
                     # Validate extraction completeness if we have structure info
                     if hasattr(st.session_state, 'ifc_structure_info') and st.session_state.ifc_structure_info:
                         validation = validate_extraction_completeness(deduplicated_result, st.session_state.ifc_structure_info)
                         
                         if validation['is_complete']:
-                            st.success(f"✅ Analysis complete! All {validation['extracted_count']} components extracted successfully. ({token_count} input tokens)")
+                            st.success(f"✅ Analysis complete! All {validation['extracted_count']} components extracted successfully. ({token_count} input tokens) • ⏱️ {execution_time:.1f}s")
                         else:
-                            st.warning(f"⚠️ Analysis complete but incomplete extraction: {validation['extracted_count']}/{validation['expected_count']} components. ({token_count} input tokens)")
+                            st.warning(f"⚠️ Analysis complete but incomplete extraction: {validation['extracted_count']}/{validation['expected_count']} components. ({token_count} input tokens) • ⏱️ {execution_time:.1f}s")
                         
                         # Show detailed validation results
                         if validation['messages']:
@@ -1161,7 +1128,7 @@ with col1:
                                 for message in validation['messages']:
                                     st.write(message)
                     else:
-                        st.success(f"✅ Analysis complete! ({token_count} input tokens)")
+                        st.success(f"✅ Analysis complete! ({token_count} input tokens) • ⏱️ {execution_time:.1f}s")
                     
                 except Exception as e:
                     st.error(f"Error during analysis: {str(e)}")
