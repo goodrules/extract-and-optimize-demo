@@ -12,16 +12,30 @@ from PIL import Image
 import io
 import base64
 import time
+import asyncio
+import re
+
+# For async compatibility in Streamlit
+import nest_asyncio
+nest_asyncio.apply()
 
 import config.schema as schemas
 from config.system_prompt import system_prompt as default_system_prompt, ifc_extraction_system_prompt
 
+# Import chunking functions
+from ifc_chunking import (
+    create_ifc_entity_index,
+    build_relationship_maps,
+    identify_core_assemblies,
+    assemble_hierarchical_chunk,
+    create_chunk_prompt,
+    process_chunk_async,
+    calculate_optimal_concurrency,
+    extract_ungrouped_components
+)
+
 # Load environment variables
 load_dotenv()
-
-def wide_space_default():
-    st.set_page_config(layout="wide")
-wide_space_default()
 
 # Page header
 st.header("🤖 IFC Drawing Analysis")
@@ -170,7 +184,7 @@ def analyze_ifc_structure(ifc_content):
         'has_placement_data': 'IFCLOCALPLACEMENT' in entities
     }
 
-def generate_ifc_extraction(client, ifc_content, model, schema):
+def generate_ifc_extraction_original(client, ifc_content, model, schema):
     """Generate extraction from IFC content string"""
     
     # Analyze IFC structure first to provide guidance to the model
@@ -270,6 +284,454 @@ Extract ALL {structure_info['total_components']} components according to the pro
     )
     
     return response, token_count.total_tokens
+
+
+async def generate_ifc_extraction_chunked_async(
+    client: genai.Client,
+    ifc_content: str,
+    model: str,
+    schema: dict,
+    structure_info: dict,
+    max_concurrent: int,
+    progress_callback=None
+) -> tuple:
+    """
+    Generate IFC extraction using async chunk processing.
+    
+    Args:
+        client: Genai client
+        ifc_content: Raw IFC content
+        model: Model name
+        schema: JSON schema
+        structure_info: Pre-analyzed structure info
+        max_concurrent: Maximum concurrent API requests
+        progress_callback: Optional callback for progress updates
+        
+    Returns:
+        Tuple of (response object, total tokens)
+    """
+    # Pre-parse and index
+    entity_index = create_ifc_entity_index(ifc_content)
+    rel_maps = build_relationship_maps(entity_index)
+    core_assemblies = identify_core_assemblies(entity_index, rel_maps)
+    
+    # Debug: Log parsing results
+    st.info(f"📊 Parsing results: {len(entity_index)} entities indexed")
+    st.info(f"🔗 Found {len(rel_maps['properties'])} entities with properties")
+    st.info(f"📦 Found {len(rel_maps['aggregations'])} aggregation relationships")
+    
+    # Debug: Check if we found any assemblies
+    if not core_assemblies:
+        st.warning("⚠️ No PIPE/BRANCH assemblies found. Processing all components as ungrouped.")
+        # Debug: Show what IFCELEMENTASSEMBLY entities we found
+        assembly_count = sum(1 for line in entity_index.values() if 'IFCELEMENTASSEMBLY' in line)
+        st.info(f"🔍 Found {assembly_count} IFCELEMENTASSEMBLY entities total")
+    else:
+        st.success(f"✅ Found {len(core_assemblies)} PIPE/BRANCH assemblies")
+        for assembly in core_assemblies[:3]:  # Show first 3
+            st.info(f"  - {assembly['type']}: {assembly['name']} (ID: {assembly['id']})")
+    
+    if progress_callback:
+        progress_callback('indexing_complete', len(core_assemblies))
+    
+    # Prepare all chunks
+    chunks_data = []
+    max_chunk_size = 80000  # Maximum characters per chunk to avoid JSON issues
+    
+    for assembly in core_assemblies:
+        chunk = assemble_hierarchical_chunk(assembly['id'], entity_index, rel_maps)
+        
+        # Check if chunk is too large
+        if len(chunk) > max_chunk_size:
+            st.warning(f"⚠️ Large assembly {assembly['name']}: {len(chunk):,} chars. Splitting may be needed.")
+            # For now, we'll still process it but warn
+        
+        chunks_data.append({
+            'assembly': assembly,
+            'chunk': chunk,
+            'prompt': create_chunk_prompt(assembly, chunk)
+        })
+    
+    # Debug: Log chunk preparation
+    st.info(f"📦 Prepared {len(chunks_data)} assembly chunks for processing")
+    if chunks_data:
+        avg_size = sum(len(c['chunk']) for c in chunks_data) / len(chunks_data)
+        st.info(f"📏 Average chunk size: {avg_size:,.0f} characters")
+    
+    # Create semaphore for rate limiting
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    # Process all chunks concurrently
+    all_components = []
+    total_tokens = 0
+    completed = 0
+    
+    async def process_with_progress(chunk_data):
+        nonlocal completed
+        result = await process_chunk_async(client, model, chunk_data, schema, semaphore)
+        
+        completed += 1
+        if progress_callback:
+            progress_callback('chunk_complete', {
+                'completed': completed,
+                'total': len(chunks_data),
+                'assembly': chunk_data['assembly'],
+                'success': result['success'],
+                'api_time': result['api_time']
+            })
+        
+        return result
+    
+    # Execute all tasks
+    tasks = [process_with_progress(chunk_data) for chunk_data in chunks_data]
+    results = await asyncio.gather(*tasks)
+    
+    # Aggregate results
+    failed_chunks = []
+    partial_chunks = []
+    
+    for result in results:
+        if result['success']:
+            all_components.extend(result['components'])
+            total_tokens += result['tokens']
+        else:
+            if result.get('partial') and result.get('components'):
+                # Partial success - we got some components
+                partial_chunks.append(result)
+                all_components.extend(result['components'])
+                total_tokens += result['tokens']
+                st.warning(f"⚠️ Partial extraction for {result['assembly']['name']}: {len(result['components'])} components recovered")
+            else:
+                # Complete failure
+                failed_chunks.append(result)
+    
+    # Report failed chunks
+    if failed_chunks:
+        st.error(f"❌ {len(failed_chunks)} chunks failed completely")
+        with st.expander("View failed chunks"):
+            for failed in failed_chunks:
+                st.error(f"{failed['assembly']['name']}: {failed.get('error', 'Unknown error')}")
+                if failed.get('traceback'):
+                    st.code(failed['traceback'])
+    
+    # Handle ungrouped components
+    ungrouped_ids = extract_ungrouped_components(entity_index, core_assemblies, rel_maps)
+    
+    # If no assemblies were found, process all components as ungrouped
+    if not core_assemblies and not ungrouped_ids:
+        # Find all component entities directly
+        ungrouped_ids = []  # Initialize as empty list
+        component_patterns = [
+            'IFCFLOWFITTING', 'IFCFLOWSEGMENT', 'IFCWALL', 'IFCSLAB',
+            'IFCBEAM', 'IFCCOLUMN', 'IFCDOOR', 'IFCWINDOW', 'IFCFLOWCONTROLLER',
+            'IFCFLOWTERMINAL', 'IFCFLOWMOVINGDEVICE', 'IFCFLOWSTORAGEDEVICE'
+        ]
+        
+        for entity_id, line in entity_index.items():
+            if any(pattern in line for pattern in component_patterns):
+                ungrouped_ids.append(entity_id)
+    
+    if ungrouped_ids:
+        # Create a chunk for ungrouped components
+        ungrouped_lines = []
+        processed_props = set()
+        processed_placements = set()
+        
+        def add_placement_entities_for_ungrouped(entity_line: str, depth=0):
+            """Extract and add placement/coordinate entities for ungrouped components."""
+            # Avoid infinite recursion
+            if depth > 10:
+                return
+                
+            # For components, focus on the placement reference (usually 5th parameter)
+            placement_refs = []
+            
+            # First, try to extract the placement reference specifically
+            if any(comp_type in entity_line for comp_type in ['IFCFLOW', 'IFCWALL', 'IFCSLAB', 'IFCBEAM', 'IFCCOLUMN']):
+                # Extract placement reference (typically 5th parameter after 4 strings/nulls)
+                match = re.search(r"[^,]+,[^,]+,[^,]+,[^,]+,\s*(#\d+)", entity_line)
+                if match:
+                    placement_refs.append(match.group(1))
+            
+            # For placement entities, get all references
+            if any(placement_type in entity_line for placement_type in ['IFCLOCALPLACEMENT', 'IFCAXIS2PLACEMENT3D']):
+                placement_refs.extend(re.findall(r'#\d+', entity_line))
+            
+            for ref_id in placement_refs:
+                if ref_id in processed_placements or ref_id not in entity_index:
+                    continue
+                    
+                ref_line = entity_index[ref_id]
+                
+                # Check if this is a placement-related entity
+                if any(placement_type in ref_line for placement_type in [
+                    'IFCLOCALPLACEMENT', 'IFCAXIS2PLACEMENT3D', 'IFCCARTESIANPOINT',
+                    'IFCDIRECTION'
+                ]):
+                    processed_placements.add(ref_id)
+                    ungrouped_lines.append(ref_line)
+                    
+                    # Recursively add placement entities referenced by this placement
+                    add_placement_entities_for_ungrouped(ref_line, depth + 1)
+        
+        for entity_id in ungrouped_ids:
+            if entity_id in entity_index:
+                entity_line = entity_index[entity_id]
+                ungrouped_lines.append(entity_line)
+                
+                # Add placement and coordinate entities
+                add_placement_entities_for_ungrouped(entity_line)
+                
+                # Add properties for ungrouped components
+                for rel_id, rel_line in entity_index.items():
+                    if rel_id not in processed_props and 'IFCRELDEFINESBYPROPERTIES' in rel_line and entity_id in rel_line:
+                        processed_props.add(rel_id)
+                        ungrouped_lines.append(rel_line)
+                        # Also add the property sets
+                        match = re.search(r',\s*(#\d+)\s*\)', rel_line)
+                        if match:
+                            pset_id = match.group(1)
+                            if pset_id in entity_index:
+                                ungrouped_lines.append(entity_index[pset_id])
+                                # Add individual properties
+                                for prop_id in rel_maps['property_sets'].get(pset_id, []):
+                                    if prop_id in entity_index:
+                                        ungrouped_lines.append(entity_index[prop_id])
+        
+        if ungrouped_lines:
+            ungrouped_chunk = '\n'.join(ungrouped_lines)
+            ungrouped_prompt = f"""Extract components from these IFC entities.
+
+These components are not part of any PIPE/BRANCH assembly.
+Total entities to extract: {len(ungrouped_ids)}
+
+IFC Data:
+{ungrouped_chunk}
+
+Extract ALL components with their properties, coordinates, and materials."""
+            
+            ungrouped_data = {
+                'assembly': {'id': 'ungrouped', 'type': 'UNGROUPED', 'name': 'Ungrouped Components'},
+                'chunk': ungrouped_chunk,
+                'prompt': ungrouped_prompt
+            }
+            
+            result = await process_chunk_async(client, model, ungrouped_data, schema, semaphore)
+            if result['success']:
+                all_components.extend(result['components'])
+                total_tokens += result['tokens']
+            else:
+                st.error(f"Failed to process ungrouped components: {result.get('error', 'Unknown error')}")
+    
+    # Extract project metadata from original content
+    project_metadata = extract_project_metadata(ifc_content)
+    spatial_placement = extract_spatial_placement(ifc_content, entity_index)
+    
+    # Verify and recalculate bounding volume as a post-processing step
+    # This ensures accurate min/max coordinates across all extracted components
+    verified_summary = recalculate_component_summary(all_components)
+    
+    # Additional verification: manually check min/max coordinates
+    if all_components:
+        manual_xs = []
+        manual_ys = []
+        manual_zs = []
+        
+        for comp in all_components:
+            if isinstance(comp.get('x'), (int, float)) and isinstance(comp.get('y'), (int, float)) and isinstance(comp.get('z'), (int, float)):
+                manual_xs.append(comp['x'])
+                manual_ys.append(comp['y'])
+                manual_zs.append(comp['z'])
+        
+        if manual_xs and manual_ys and manual_zs:
+            manual_bounds = {
+                'minX': min(manual_xs),
+                'minY': min(manual_ys),
+                'minZ': min(manual_zs),
+                'maxX': max(manual_xs),
+                'maxY': max(manual_ys),
+                'maxZ': max(manual_zs)
+            }
+            
+            # Log if there's a discrepancy
+            if manual_bounds != verified_summary['boundingVolume']:
+                st.warning(f"⚠️ Bounding volume verification found discrepancy. Using manually calculated bounds.")
+                verified_summary['boundingVolume'] = manual_bounds
+    
+    # Assemble final result
+    final_result = {
+        'projectMetadata': project_metadata,
+        'overallSpatialPlacement': spatial_placement,
+        'components': all_components,
+        'componentSummary': verified_summary
+    }
+    
+    # Create mock response for compatibility
+    class MockResponse:
+        def __init__(self, text):
+            self.text = text
+    
+    return MockResponse(json.dumps(final_result)), total_tokens
+
+
+def extract_project_metadata(ifc_content: str) -> dict:
+    """Extract project metadata from IFC header and IFCPROJECT entity."""
+    metadata = {
+        'projectName': None,
+        'globalId': None,
+        'creationDate': None,
+        'authoringTool': None,
+        'organization': None,
+        'schemaVersion': None
+    }
+    
+    # Extract from header
+    header_match = re.search(r'FILE_NAME\((.*?)\);', ifc_content, re.DOTALL)
+    if header_match:
+        header_parts = header_match.group(1).split(',')
+        if len(header_parts) > 1:
+            metadata['creationDate'] = header_parts[1].strip("'\" ")
+        if len(header_parts) > 4:
+            metadata['authoringTool'] = header_parts[4].strip("'\" ")
+        if len(header_parts) > 5:
+            metadata['organization'] = header_parts[5].strip("'\" ")
+    
+    # Extract schema version
+    schema_match = re.search(r'FILE_SCHEMA\(\((.*?)\)\)', ifc_content)
+    if schema_match:
+        metadata['schemaVersion'] = schema_match.group(1).strip("'\" ")
+    
+    # Extract from IFCPROJECT
+    project_match = re.search(r'IFCPROJECT\(\'([^\']+)\'[^,]*,[^,]*,\'([^\']+)\'', ifc_content)
+    if project_match:
+        metadata['globalId'] = project_match.group(1)
+        metadata['projectName'] = project_match.group(2)
+    
+    return metadata
+
+
+def extract_spatial_placement(ifc_content: str, entity_index: dict = None) -> dict:
+    """Extract overall spatial placement information."""
+    spatial = {
+        'site': {'name': None, 'easting': 0, 'northing': 0, 'elevation': 0},
+        'building': {'name': None, 'x': 0, 'y': 0, 'z': 0}
+    }
+    
+    # Extract IFCSITE
+    site_match = re.search(r'IFCSITE\(\'[^\']+\'[^,]*,[^,]*,\'([^\']+)\'', ifc_content)
+    if site_match:
+        spatial['site']['name'] = site_match.group(1)
+    
+    # Extract IFCBUILDING
+    building_match = re.search(r'IFCBUILDING\(\'[^\']+\'[^,]*,[^,]*,\'([^\']+)\'', ifc_content)
+    if building_match:
+        spatial['building']['name'] = building_match.group(1)
+    
+    # TODO: Extract actual coordinates from placement entities using entity_index if provided
+    
+    return spatial
+
+
+def generate_ifc_extraction(client, ifc_content, model, schema, use_chunking=None, max_concurrent=10):
+    """
+    Generate extraction from IFC content with optional chunking.
+    
+    Args:
+        client: Genai client
+        ifc_content: Raw IFC content
+        model: Model name
+        schema: JSON schema
+        use_chunking: Whether to use chunking (if None, determined by component count)
+        max_concurrent: Maximum concurrent API calls for chunking
+        
+    Returns:
+        Tuple of (response, token_count)
+    """
+    # Analyze IFC structure first
+    structure_info = analyze_ifc_structure(ifc_content)
+    
+    # Store structure info in session state for validation
+    st.session_state.ifc_structure_info = structure_info
+    
+    # Display analysis to user
+    st.info(f"📊 IFC Analysis: Found {structure_info['total_components']} components across {len(structure_info['component_types'])} types")
+    
+    # Determine whether to use chunking
+    if use_chunking is None:
+        use_chunking = structure_info['total_components'] > 50
+    
+    # Check if we should use chunking
+    # For testing, allow chunking on smaller files with a debug override
+    chunking_threshold = 50
+    if st.session_state.get('debug_chunking', False):
+        chunking_threshold = 5  # Lower threshold for testing
+    
+    should_chunk = use_chunking and structure_info['total_components'] > chunking_threshold
+    
+    # Debug info
+    if use_chunking:
+        st.info(f"🔍 Chunking is {'enabled' if should_chunk else f'disabled (file has ≤{chunking_threshold} components)'}")
+    
+    if should_chunk:
+        st.info(f"🔧 Using chunking strategy for {structure_info['total_components']} components")
+        
+        # Create progress tracking UI
+        progress_container = st.container()
+        
+        with progress_container:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            metrics_cols = st.columns(4)
+        
+        # Progress callback for async processing
+        def progress_callback(event_type, data):
+            if event_type == 'indexing_complete':
+                status_text.info(f"📑 Identified {data} core assemblies for processing")
+            elif event_type == 'chunk_complete':
+                progress = data['completed'] / data['total']
+                progress_bar.progress(progress)
+                
+                if data['success']:
+                    status_text.success(f"✅ Processed {data['assembly']['name']} ({data['api_time']:.1f}s)")
+                else:
+                    status_text.error(f"❌ Failed {data['assembly']['name']}")
+                
+                # Update metrics
+                with metrics_cols[0]:
+                    st.metric("Progress", f"{data['completed']}/{data['total']}")
+                with metrics_cols[1]:
+                    st.metric("Success Rate", f"{(data['completed'] - len([d for d in [data] if not d['success']])) / data['completed'] * 100:.0f}%")
+        
+        # Run async extraction
+        async def run_async_extraction():
+            return await generate_ifc_extraction_chunked_async(
+                client, ifc_content, model, schema, structure_info, 
+                max_concurrent, progress_callback
+            )
+        
+        try:
+            # Debug logging
+            st.info("🔍 Starting async chunking process...")
+            response, token_count = asyncio.run(run_async_extraction())
+            progress_container.empty()  # Clear progress UI
+            st.success(f"✅ Chunking completed with {token_count} tokens")
+            return response, token_count
+        except Exception as e:
+            progress_container.empty()
+            st.error(f"Chunking failed: {str(e)}")
+            import traceback
+            st.error(f"Traceback: {traceback.format_exc()}")
+            # Fall back to original method
+            st.warning("Falling back to standard processing...")
+            return generate_ifc_extraction_original(client, ifc_content, model, schema)
+    else:
+        # Use original single-pass extraction
+        if structure_info['component_types']:
+            with st.expander("View Component Breakdown"):
+                for comp_type, count in structure_info['component_types'].items():
+                    st.write(f"- {comp_type}: {count}")
+        
+        return generate_ifc_extraction_original(client, ifc_content, model, schema)
 
 def validate_extraction_completeness(extracted_data, expected_structure):
     """Validate that the extraction captured all expected components"""
@@ -481,6 +943,8 @@ def recalculate_component_summary(components):
     xs = []
     ys = []
     zs = []
+    components_with_coords = 0
+    components_with_partial_coords = 0
     
     for component in components:
         # Check if component has valid coordinate data
@@ -488,13 +952,28 @@ def recalculate_component_summary(components):
         y = component.get('y')
         z = component.get('z')
         
-        # Only include coordinates that are present and numeric
-        if x is not None and isinstance(x, (int, float)):
+        # Check if all coordinates are present and numeric
+        has_x = x is not None and isinstance(x, (int, float))
+        has_y = y is not None and isinstance(y, (int, float))
+        has_z = z is not None and isinstance(z, (int, float))
+        
+        # Only include components with ALL three coordinates for bounding volume
+        if has_x and has_y and has_z:
             xs.append(x)
-        if y is not None and isinstance(y, (int, float)):
             ys.append(y)
-        if z is not None and isinstance(z, (int, float)):
             zs.append(z)
+            components_with_coords += 1
+        elif has_x or has_y or has_z:
+            # Track components with partial coordinates
+            components_with_partial_coords += 1
+    
+    # Debug logging
+    if components_with_coords == 0:
+        import streamlit as st
+        st.warning(f"⚠️ No components have complete x,y,z coordinates. Found {components_with_partial_coords} with partial coordinates out of {len(components)} total.")
+    elif components_with_coords < len(components):
+        import streamlit as st
+        st.info(f"ℹ️ {components_with_coords}/{len(components)} components have complete coordinates for bounding volume calculation.")
     
     for component in components:
         comp_type = component.get('type', 'Unknown')
@@ -964,6 +1443,46 @@ with st.sidebar:
     else:
         st.info("ℹ️ No Work Package data")
     
+    # Advanced Options
+    st.divider()
+    st.subheader("⚙️ Advanced Options")
+    
+    # Chunking configuration
+    col1_adv, col2_adv = st.columns(2)
+    
+    with col1_adv:
+        use_chunking = st.checkbox(
+            "Use Chunking",
+            value=True,
+            help="Enable hierarchical chunking for files with >50 components. Improves speed and accuracy.",
+            key="use_chunking"
+        )
+    
+    with col2_adv:
+        max_concurrent = st.number_input(
+            "Max Concurrent",
+            min_value=1,
+            max_value=20,
+            value=10,
+            help="Maximum parallel API calls when chunking is enabled",
+            key="max_concurrent",
+            disabled=not use_chunking
+        )
+    
+    if use_chunking:
+        st.info(f"🚀 Chunking enabled (up to {max_concurrent} parallel calls)")
+    else:
+        st.info("📝 Standard processing (single API call)")
+    
+    # Debug options (hidden by default)
+    with st.expander("🔧 Debug Options"):
+        debug_chunking = st.checkbox(
+            "Force chunking on small files",
+            value=False,
+            help="Enable chunking for files with >5 components (for testing)",
+            key="debug_chunking"
+        )
+    
     # Refresh button
     st.divider()
     if st.button("🔄 Refresh Page", use_container_width=True):
@@ -1091,9 +1610,14 @@ with col1:
                     # Get IFC schema
                     ifc_schema = schemas.ifc_schema
                     
+                    # Get chunking settings from sidebar
+                    use_chunking = st.session_state.get('use_chunking', True)
+                    max_concurrent = st.session_state.get('max_concurrent', 10)
+                    
                     # Generate extraction (this also analyzes structure and stores it)
                     response, token_count = generate_ifc_extraction(
-                        client, ifc_content, model_option, ifc_schema
+                        client, ifc_content, model_option, ifc_schema,
+                        use_chunking=use_chunking, max_concurrent=max_concurrent
                     )
                     
                     # Parse and store result
