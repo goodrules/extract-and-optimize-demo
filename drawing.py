@@ -19,9 +19,9 @@ from config.system_prompt import system_prompt as default_system_prompt, ifc_ext
 # Load environment variables
 load_dotenv()
 
-def wide_space_default():
-    st.set_page_config(layout="wide")
-wide_space_default()
+#def wide_space_default():
+#    st.set_page_config(layout="wide")
+#wide_space_default()
 
 # Page header
 st.header("🤖 IFC Drawing Analysis")
